@@ -34,6 +34,7 @@ from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
 from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
+from lerobot.policies.smolandfast.configuration_smolandfast import SMOLANDFASTConfig
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
@@ -113,6 +114,10 @@ def get_policy_class(name: str) -> type[PreTrainedPolicy]:
         from lerobot.policies.xvla.modeling_xvla import XVLAPolicy
 
         return XVLAPolicy
+    elif name == "vla0_smol":
+        from lerobot.policies.vla0_smol.modeling_vla0_smol import VLA0SmolPolicy
+
+        return VLA0SmolPolicy
     else:
         try:
             return _get_policy_cls_from_policy_name(name=name)
@@ -161,6 +166,13 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
         return GrootConfig(**kwargs)
     elif policy_type == "xvla":
         return XVLAConfig(**kwargs)
+<<<<<<< HEAD
+    elif policy_type == "smolandfast":
+        return SMOLANDFASTConfig(**kwargs)
+=======
+    elif policy_type == "vla0_smol":
+        return VLA0SmolConfig(**kwargs)
+>>>>>>> f6d512e1 (cleanup)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)
@@ -336,9 +348,23 @@ def make_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
+<<<<<<< HEAD
+    
+    elif isinstance(policy_cfg, SMOLANDFASTConfig):
+        from lerobot.policies.smolandfast.processor_smolandfast import make_smolandfast_pre_post_processors
+
+        processors = make_smolandfast_pre_post_processors(
+            config=policy_cfg,
+            dataset_stats=kwargs.get("dataset_stats"),
+        )
 
     elif isinstance(policy_cfg, GrootConfig):
         from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
+=======
+
+    elif isinstance(policy_cfg, VLA0SmolConfig):
+        from lerobot.policies.vla0_smol.processor_vla0_smol import make_vla0_smol_pre_post_processors
+>>>>>>> f6d512e1 (cleanup)
 
         processors = make_groot_pre_post_processors(
             config=policy_cfg,
@@ -447,7 +473,7 @@ def make_policy(
     policy.to(cfg.device)
     assert isinstance(policy, torch.nn.Module)
 
-    # policy = torch.compile(policy, mode="reduce-overhead")
+    # policy.model.model.vlm.text_model = torch.compile(policy.model.model.vlm.text_model)#, mode="reduce-overhead")
 
     if not rename_map:
         validate_visual_features_consistency(cfg, features)
