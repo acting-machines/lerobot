@@ -35,6 +35,7 @@ from lerobot.policies.groot.configuration_groot import GrootConfig
 from lerobot.policies.pi0.configuration_pi0 import PI0Config
 from lerobot.policies.pi05.configuration_pi05 import PI05Config
 from lerobot.policies.smolandfast.configuration_smolandfast import SMOLANDFASTConfig
+from lerobot.policies.vla0.configuration_vla0 import VLA0Config
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.sac.configuration_sac import SACConfig
 from lerobot.policies.sac.reward_model.configuration_classifier import RewardClassifierConfig
@@ -169,10 +170,15 @@ def make_policy_config(policy_type: str, **kwargs) -> PreTrainedConfig:
 <<<<<<< HEAD
     elif policy_type == "smolandfast":
         return SMOLANDFASTConfig(**kwargs)
+<<<<<<< HEAD
 =======
     elif policy_type == "vla0_smol":
         return VLA0SmolConfig(**kwargs)
 >>>>>>> f6d512e1 (cleanup)
+=======
+    elif policy_type == "vla0":
+        return VLA0Config(**kwargs)
+>>>>>>> fca60091 (Rebase + Libero support)
     else:
         try:
             config_cls = PreTrainedConfig.get_choice_class(policy_type)
@@ -357,7 +363,11 @@ def make_pre_post_processors(
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
+    
+    elif isinstance(policy_cfg, VLA0Config):
+        from lerobot.policies.vla0.processor_vla0 import make_vla0_pre_post_processors
 
+<<<<<<< HEAD
     elif isinstance(policy_cfg, GrootConfig):
         from lerobot.policies.groot.processor_groot import make_groot_pre_post_processors
 =======
@@ -376,6 +386,9 @@ def make_pre_post_processors(
         )
 
         processors = make_xvla_pre_post_processors(
+=======
+        processors = make_vla0_pre_post_processors(
+>>>>>>> fca60091 (Rebase + Libero support)
             config=policy_cfg,
             dataset_stats=kwargs.get("dataset_stats"),
         )
@@ -469,18 +482,9 @@ def make_policy(
     else:
         # Make a fresh policy.
         policy = policy_cls(**kwargs)
-
+    
     policy.to(cfg.device)
     assert isinstance(policy, torch.nn.Module)
-
-    if cfg.type == "smolandfast":
-        policy.model.vlm.model.text_model = torch.compile(policy.model.vlm.model.text_model)
-        policy.model.vlm.model.connector = torch.compile(policy.model.vlm.model.connector)
-        policy.model.vlm.model.vision_model = torch.compile(policy.model.vlm.model.vision_model)
-
-    if not rename_map:
-        validate_visual_features_consistency(cfg, features)
-        # TODO: (jadechoghari) - add a check_state(cfg, features) and check_action(cfg, features)
 
     return policy
 
