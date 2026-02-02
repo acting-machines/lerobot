@@ -125,13 +125,27 @@ class VLA0SmolPolicy(PreTrainedPolicy):
         return loss, loss_dict
 
 
-def build_exact_n_numbers_grammar(n_numbers: int) -> str:
+def get_range_regex(min_val: int, max_val: int) -> str:
+    if min_val == 0 and max_val == 1024:
+        # 0-9 | 10-99 | 100-999 | 1000-1019 | 1020-1023
+        return '([0-9] | [1-9] [0-9] | [1-9] [0-9] [0-9] | "10" [0-1] [0-9] | "102" [0-3])'
+    elif min_val == 0 and max_val == 512:
+        # 0-9 | 10-99 | 100-499 | 500-509 | 510-511
+        return '([0-9] | [1-9] [0-9] | [1-4] [0-9] [0-9] | "50" [0-9] | "51" [0-1])'
+    elif min_val == 0 and max_val == 256:
+        # 0-9 | 10-99 | 100-199 | 200-249 | 250-255
+        return '([0-9] | [1-9] [0-9] | "1" [0-9] [0-9] | "2" [0-4] [0-9] | "25" [0-5])'
+    else:
+        raise ValueError(f"Range {min_val}:{max_val} is not supported.")
+
+
+def build_exact_n_numbers_grammar(n_numbers: int, min_val: int, max_val: int) -> str:
     """
     Constructs an EBNF grammar that enforces exactly `n_numbers` integers.
     """
-    # integer ::= "-"? [0-9]+
-    base_rules = """
-    integer ::= "-"? [0-9]+
+    int_pattern = get_range_regex(min_val, max_val)
+    base_rules = f"""
+    integer ::= {int_pattern}
     space ::= " "
     """
 
@@ -416,11 +430,13 @@ class VLA0(nn.Module):
         self.vlm.resize_token_embeddings(len(self.processor.tokenizer), mean_resizing=False)
         self.mask_token_id = self.processor.tokenizer.convert_tokens_to_ids(self.actions_mask_symbol)
 
-        tokenizer_info = xgr.TokenizerInfo.from_huggingface(self.processor.tokenizer)
-        self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
+        self.tokenizer_info = xgr.TokenizerInfo.from_huggingface(self.processor.tokenizer)
+        self.grammar_compiler = xgr.GrammarCompiler(self.tokenizer_info)
         total_actions = self.config.chunk_size * self.config.action_feature.shape[0]
-        ebnf_string = build_exact_n_numbers_grammar(total_actions)
+        ebnf_string = build_exact_n_numbers_grammar(total_actions, 0, self.config.n_action_bins)
         self.compiled_grammar = self.grammar_compiler.compile_grammar(ebnf_string)
+        self.grammar_matcher = xgr.GrammarMatcher(self.compiled_grammar)
+        self.token_bitmask = None
 
         # stream generation
         self.new_obs = True
@@ -730,7 +746,11 @@ class VLA0(nn.Module):
                            use_cache=True,
                            output_hidden_states=True)
 
+        self.grammar_matcher.fill_next_token_bitmask(self.token_bitmask)
+        xgr.apply_token_bitmask_inplace(out.logits[:, -1, :], self.token_bitmask.to(out.logits.device))
+
         generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
+        self.grammar_matcher.accept_token(generated_token.item())
         return generated_token, out
         
     def initialise_new_generation(self, batch):
@@ -748,6 +768,7 @@ class VLA0(nn.Module):
         device = batch[OBS_STATE].device
         batch_size = batch[OBS_STATE].shape[0]
 
+        self.token_bitmask = xgr.allocate_token_bitmask(batch_size, self.tokenizer_info.vocab_size)
         next_action_is_generated = [False]*batch_size
         decoded_actions = [None]*batch_size
 
