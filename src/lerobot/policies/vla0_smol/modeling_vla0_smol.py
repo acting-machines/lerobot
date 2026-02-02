@@ -1,56 +1,26 @@
 #!/usr/bin/env python
 
-import time
+import asyncio
 import logging
-import random
-import requests
 import queue
 import threading
+import time
 from collections import deque
-from fastapi import requests
-from typing import AsyncGenerator
 
 import torch
-from torch import Tensor, nn
-from torch.profiler import record_function
-from torchvision.transforms import CenterCrop, RandomCrop
+from torch import Tensor
 
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
-from lerobot.utils.constants import ACTION, OBS_STATE
-from lerobot.policies.vla0_smol.monkey_patch import patch_SmolVLM_amp, patch_SmolVLMProcessor
 from lerobot.policies.vla0_smol.temporal_ensembler import VLA0TemporalEnsembler
+from lerobot.policies.vla0_smol.vla0_smol_local import VLA0Local
 
 try:
-    from transformers import AutoModelForImageTextToText, AutoProcessor
-    from transformers.models.smolvlm.image_processing_smolvlm_fast import SmolVLMImageProcessorFast
-    import xgrammar as xgr
-    HAS_LOCAL_DEPS = True
-except ImportError:
-    HAS_LOCAL_DEPS = False
+    from lerobot.policies.vla0_smol.vla0_smol_remote import VLA0Client
 
-try:
-    import base64
-    import io
-    import numpy as np
-    from PIL import Image
-
-    import asyncio
-    from openai import AsyncOpenAI
-
-    logging.getLogger("httpx").setLevel(logging.WARNING)
     HAS_REMOTE_DEPS = True
 except ImportError:
     HAS_REMOTE_DEPS = False
-
-PRECISION = {
-    "float16": torch.float16,
-    "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
-}
-
-EPS = 1e-6
-SERVER_PROFILE = False
 
 
 class VLA0SmolPolicy(PreTrainedPolicy):
@@ -83,8 +53,6 @@ class VLA0SmolPolicy(PreTrainedPolicy):
             self.service = AsyncInferenceService(self.model)
         else:
             logging.info("VLA0 Policy: Initializing in LOCAL TRAINING mode (PyTorch).")
-            if not HAS_LOCAL_DEPS:
-                raise ImportError("Missing transformers/xgrammar deps for local training.")
             self.model = VLA0Local(config)
 
         self.use_ensembling = self.config.ensemble_size > 1
@@ -104,6 +72,7 @@ class VLA0SmolPolicy(PreTrainedPolicy):
     def reset(self):
         """This should be called whenever the environment is reset."""
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
+        self.should_run_model = True
 
         if self.use_ensembling:
             self.temporal_ensembler.reset()
@@ -116,56 +85,65 @@ class VLA0SmolPolicy(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         raise NotImplementedError("Currently not implemented for VLA0")
 
-    # @torch.no_grad()
-    # def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-    #     """Select a single action given environment observations.
-
-    #     This method wraps `select_actions` in order to return one action at a time for execution in the
-    #     environment. It works by managing the actions in a queue and only calling `select_actions` when the
-    #     queue is empty.
-    #     """
-    #     self.eval()
-
-    #     if self.use_ensembling:
-    #         actions = self.model.generate_actions(batch)
-
-    #         original_action_dim = self.config.action_feature.shape[0]
-    #         actions = actions[:, :, :original_action_dim]
-
-    #         return self.temporal_ensembler.update(actions)
-    #     else:
-    #         # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
-    #         # querying the policy.
-    #         if len(self._action_queue) == 0:
-    #             actions = self.model.generate_actions(batch)
-    #             actions = actions[:, : self.config.n_action_steps]
-
-    #             original_action_dim = self.config.action_feature.shape[0]
-    #             actions = actions[:, :, :original_action_dim]
-    #             # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
-    #             # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
-    #             self._action_queue.extend(actions.transpose(0, 1))
-    #         return self._action_queue.popleft()
-
-    def _handle_simple_action(self, action):
-        self._action_queue.append(action)
-
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         if self.config.use_vllm_client:
+            return self.select_action_remote(batch)
+        else:
+            return self.select_action_local(batch)
 
-            if self.use_ensembling:
-                raise NotImplementedError("Ensemble mode not implemented for vLLM client yet.")
+    def select_action_local(self, batch: dict[str, Tensor]) -> Tensor:
+        """Select a single action given environment observations.
 
-            else:
-                if not self._action_queue:
-                    self.service.submit_request(batch, self._handle_simple_action)
+        This method wraps `select_actions` in order to return one action at a time for execution in the
+        environment. It works by managing the actions in a queue and only calling `select_actions` when the
+        queue is empty.
+        """
+        self.eval()
 
+        if self.use_ensembling:
+            actions = self.model.generate_actions(batch)
+
+            original_action_dim = self.config.action_feature.shape[0]
+            actions = actions[:, :, :original_action_dim]
+
+            return self.temporal_ensembler.update(actions)
+        else:
+            # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
+            # querying the policy.
+            if len(self._action_queue) == 0:
+                actions = self.model.generate_actions(batch)
+                actions = actions[:, : self.config.n_action_steps]
+
+                original_action_dim = self.config.action_feature.shape[0]
+                actions = actions[:, :, :original_action_dim]
+                # `self.model.forward` returns a (batch_size, n_action_steps, action_dim) tensor, but the queue
+                # effectively has shape (n_action_steps, batch_size, *), hence the transpose.
+                self._action_queue.extend(actions.transpose(0, 1))
+            return self._action_queue.popleft()
+
+    def select_action_remote(self, batch: dict[str, Tensor]) -> Tensor:
+        if self.use_ensembling:
+            raise NotImplementedError("Ensemble mode not implemented for vLLM client yet.")
+
+        else:
+            if self.should_run_model:
+                self.service.submit_request(
+                    batch,
+                    lambda action: self._action_queue.append(action),
+                )
+
+            while not self._action_queue:
+                time.sleep(0.01)
+
+            idx, action = self._action_queue.popleft()
+            while idx >= self.config.n_action_steps:
                 while not self._action_queue:
                     time.sleep(0.01)
-                return self._action_queue.popleft()
-        else:
-            raise NotImplementedError("select_action is only implemented for vLLM client mode.")
+
+                idx, action = self._action_queue.popleft()
+            self.should_run_model = idx >= self.config.n_action_steps - 1
+            return action
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         loss_dict = self.model.forward(batch)
@@ -177,7 +155,7 @@ class AsyncInferenceService:
     def __init__(self, model_client):
         self.model = model_client
         # Queue stores: (batch, callback_function)
-        self.request_queue = queue.Queue(maxsize=1) 
+        self.request_queue = queue.Queue(maxsize=1)
         self._stop_event = threading.Event()
         self.thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.thread.start()
@@ -206,600 +184,8 @@ class AsyncInferenceService:
     async def _stream_task(self, batch, callback):
         try:
             async for action in self.model.stream_actions_async(batch):
-                callback(action) 
+                callback(action)
+
         except Exception as e:
             logging.error(f"Streaming error: {e}")
-
-
-def get_range_regex(min_val: int, max_val: int) -> str:
-    if min_val == 0 and max_val == 1024:
-        # 0-9 | 10-99 | 100-999 | 1000-1019 | 1020-1023
-        return (
-            "("
-            "[0-9] | "
-            "[1-9] [0-9] | "
-            "[1-9] [0-9] [0-9] | "
-            "\"10\" [0-1] [0-9] | "
-            "\"102\" [0-3]"
-            ")"
-        )
-    elif min_val == 0 and max_val == 512:
-        # 0-9 | 10-99 | 100-499 | 500-509 | 510-511
-        return (
-            "("
-            "[0-9] | "
-            "[1-9] [0-9] | "
-            "[1-4] [0-9] [0-9] | "
-            "\"50\" [0-9] | "
-            "\"51\" [0-1]"
-            ")"
-        )
-    elif min_val == 0 and max_val == 256:
-        # 0-9 | 10-99 | 100-199 | 200-249 | 250-255
-        return (
-            "("
-            "[0-9] | "
-            "[1-9] [0-9] | "
-            "\"1\" [0-9] [0-9] | "
-            "\"2\" [0-4] [0-9] | "
-            "\"25\" [0-5]"
-            ")"
-        )
-    else:
-        raise ValueError(f"Range {min_val}:{max_val} is not supported.")
-
-
-def build_exact_n_numbers_grammar(n_numbers: int, min_val: int, max_val: int) -> str:
-    """
-    Constructs an EBNF grammar that enforces exactly `n_numbers` integers.
-    """
-    int_pattern = get_range_regex(min_val, max_val)
-    base_rules = f"""
-    integer ::= {int_pattern}
-    space ::= " "
-    """
-
-    # Build the exact sequence string: integer space integer space integer ...
-    # We construct "integer " * (N-1) + "integer"
-    sequence_parts = ["integer"] * n_numbers
-    sequence_rule = "root ::= space " + " space ".join(sequence_parts)
-
-    return base_rules + sequence_rule
-
-
-class VLA0Local(nn.Module):
-    def __init__(self, config: VLA0SmolConfig):
-        super().__init__()
-        self.config = config
-
-        self.precision = PRECISION.get(config.precision, torch.float32)
-        self.vlm = AutoModelForImageTextToText.from_pretrained(
-            self.config.vlm_checkpoint, dtype=self.precision
-        )
-
-        # Patch SmolVLMProcessor to enable using SmolVLMImageProcessorFast
-        patch_SmolVLMProcessor()
-
-        # Patch SmolVLM to enable AMP training
-        patch_SmolVLM_amp(False)
-
-        image_processor = SmolVLMImageProcessorFast.from_pretrained(
-            self.config.vlm_checkpoint,
-        )
-
-        self.processor = AutoProcessor.from_pretrained(
-            self.config.vlm_checkpoint,
-            image_processor=image_processor,
-            use_fast=True,
-        )
-
-        self.action_horizon = self.config.chunk_size
-        self.action_dim = self.config.action_feature.shape[0]
-
-        if config.freeze_vision_encoder:
-            for param in self.vlm.model.vision_model.parameters():
-                param.requires_grad = False
-
-        self.pad_token_id = self.processor.tokenizer.pad_token_id
-        self.eos_token_id = self.processor.tokenizer.eos_token_id
-
-        self.image_keys = self.config.image_features.keys()
-
-        self.do_crop = config.crop_shape is not None
-        if self.do_crop:
-            self.random_crop_fn = RandomCrop(config.crop_shape)
-            self.center_crop_fn = CenterCrop(config.crop_shape)
-
-        self.actions_mask_symbol = "<MASK_ACT>"
-        assert self.actions_mask_symbol not in self.processor.tokenizer.get_vocab(), (
-            f"Replace {self.actions_mask_symbol} token with a different token."
-        )
-        self.processor.tokenizer.add_tokens([self.actions_mask_symbol], special_tokens=True)
-        self.vlm.resize_token_embeddings(len(self.processor.tokenizer), mean_resizing=False)
-        self.mask_token_id = self.processor.tokenizer.convert_tokens_to_ids(self.actions_mask_symbol)
-
-        tokenizer_info = xgr.TokenizerInfo.from_huggingface(self.processor.tokenizer)
-        self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
-        total_actions = self.config.chunk_size * self.config.action_feature.shape[0]
-        ebnf_string = build_exact_n_numbers_grammar(total_actions, 0, self.config.n_action_bins)
-        self.compiled_grammar = self.grammar_compiler.compile_grammar(ebnf_string)
-
-    def apply_action_masking(self, actions: list[list[str]]):
-        if not self.training:
-            return actions
-
-        if random.random() < self.config.action_mask_skip_per:
-            return actions
-
-        num_actions = len(actions)
-
-        aug_per = random.uniform(0.0, self.config.action_mask_aug_per)
-        num_actions_to_mask = int(num_actions * aug_per)
-
-        if num_actions_to_mask > 0:
-            indices = random.sample(range(num_actions), num_actions_to_mask)
-
-            for idx in indices:
-                actions[idx] = self.actions_mask_symbol
-
-        return actions
-
-    def create_prefix_tokens(
-        self,
-        states: torch.Tensor,
-        images: torch.Tensor,
-        lang_text: str,
-        actions: torch.Tensor | None,
-    ):
-        device = states.device
-        batch_size = states.shape[0]
-
-        # Precompute bin edges on GPU
-        bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)[:-1]
-
-        # Discretize directly on GPU
-        discretized_states = torch.bucketize(states, bins) - 1  # shape: [B, state_dim]
-
-        # Move the batched results to CPU only once for string formatting
-        disc_states_cpu = discretized_states.detach().cpu().numpy()
-
-        if actions is None:
-            disc_actions_cpu = [""] * batch_size
-        else:
-            if self.config.relative_actions:
-                actions = actions - states.unsqueeze(1)
-            discretized_actions = torch.bucketize(actions, bins) - 1  # shape: [B, state_dim]
-            disc_actions_cpu = discretized_actions.detach().cpu().numpy()
-
-        # Build strings in batch
-        prompts = []
-        for txt, disc_st, act in zip(lang_text, disc_states_cpu, disc_actions_cpu, strict=False):
-            task_cleaned = txt.lower().strip().replace("_", " ")
-            state_str = " ".join(map(str, disc_st.tolist()))
-
-            if self.config.use_state:
-                prefix = f"Task: {task_cleaned}, State: {state_str}, Actions: "
-            else:
-                prefix = f"Task: {task_cleaned}, Actions: "
-
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        *[{"type": "image"} for _ in range(len(images))],
-                        {
-                            "type": "text",
-                            "text": prefix,
-                        },
-                    ],
-                }
-            ]
-
-            if actions is not None:
-                action_list = list(map(str, act.flatten().tolist()))
-                action_list = self.apply_action_masking(action_list)
-                action_str = " ".join(action_list)
-                messages.append(
-                    {
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": f"{action_str}",
-                            },
-                        ],
-                    }
-                )
-            prompts.append(
-                self.processor.apply_chat_template(messages, add_generation_prompt=actions is None)
-            )
-
-        images = {
-            camera_name: list(torch.unbind(camera_images, dim=0))
-            for camera_name, camera_images in images.items()
-        }
-
-        images_reshaped = []
-        for imgs in zip(*images.values(), strict=True):
-            if self.do_crop:
-                crop_fn = self.random_crop_fn if self.training else self.center_crop_fn
-                images_reshaped.append([crop_fn(img) for img in imgs])
-            else:
-                images_reshaped.append(list(imgs))
-
-        prefix_out = self.processor(
-            images=images_reshaped,
-            text=prompts,
-            do_resize=self.config.do_image_splitting,
-            do_rescale=False,
-            return_tensors="pt",
-            padding=True,
-            padding_side="right" if actions is not None else "left",
-        )
-        return prefix_out
-
-    def create_input_tokens(
-        self,
-        states: torch.Tensor,
-        images: torch.Tensor,
-        lang_text: str,
-        actions: torch.Tensor | None = None,
-    ):
-        device = states.device
-
-        prefix_out = self.create_prefix_tokens(
-            states=states, images=images, lang_text=lang_text, actions=actions
-        )
-        prefix_out = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in prefix_out.items()}
-
-        if actions is None:
-            loss_mask = None
-        else:
-            split_mask = torch.where(prefix_out["input_ids"] == self.config.start_actions_token, 1, 0)
-            loss_mask = torch.cumsum(split_mask, dim=-1).clamp(0, 1) & prefix_out["attention_mask"]
-            is_masked_token = prefix_out["input_ids"] == self.mask_token_id
-            loss_mask = loss_mask & (~is_masked_token)
-
-        return prefix_out, loss_mask
-
-    def prepare_images(self, batch: torch.Tensor):
-        """Preprocess LeRobot batch into inputs"""
-        images = {}
-        present_img_keys = [key for key in self.image_keys if key in batch]
-        if len(present_img_keys) == 0:
-            raise ValueError(
-                f"All image features are missing from the batch. At least one expected. (batch: {batch.keys()}) (image_features:{self.config.image_features})"
-            )
-
-        for key in self.image_keys:
-            if key in present_img_keys:
-                img = batch[key]
-
-            images[key] = img
-        return images
-
-    def forward(self, batch: dict[str, Tensor]):
-        device = batch[OBS_STATE].device
-
-        with record_function("create_input_tokens"):
-            images = self.prepare_images(batch)
-
-            padded_outs, loss_mask = self.create_input_tokens(
-                states=batch[OBS_STATE],
-                images=images,
-                lang_text=batch.get("task", ""),
-                actions=batch[ACTION],
-            )
-
-        with record_function("forward"):
-            outputs = self.vlm.forward(
-                input_ids=padded_outs["input_ids"],
-                attention_mask=padded_outs["attention_mask"],
-                pixel_values=padded_outs["pixel_values"],
-                pixel_attention_mask=padded_outs["pixel_attention_mask"],
-                use_cache=self.config.use_cache,
-            )
-
-        with record_function("loss"):
-            logits = outputs.logits
-            logits = logits.to(torch.float32)
-
-            loss_fct = nn.CrossEntropyLoss(reduction="none")
-
-            # Shift left for next-step prediction
-            logits = logits[:, :-1, :]
-            targets = padded_outs["input_ids"][:, 1:].to(device)  # Shift targets
-            loss_mask = loss_mask[:, 1:].to(device)  # Ensure correct shape
-
-            # Compute per-token loss
-            token_loss = loss_fct(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
-
-            # Apply loss mask
-            token_loss = token_loss * loss_mask.reshape(-1)
-
-            # Compute final loss
-            loss = token_loss.sum() / torch.clamp(loss_mask.sum(), min=1)
-
-            # Return loss dictionary
-            loss_dict = {
-                "ce_loss": loss.item(),
-                "loss": loss,
-                "sequence_len": padded_outs["input_ids"].shape[-1],
-            }
-        return loss_dict
-
-    def generate_actions(self, batch: dict[str, torch.Tensor]):
-        device = next(self.vlm.parameters()).device
-        batch_size = batch[OBS_STATE].shape[0]
-
-        images = self.prepare_images(batch)
-
-        # Prepare inputs directly on GPU
-        padded_outs, _ = self.create_input_tokens(
-            states=batch[OBS_STATE],
-            images=images,
-            lang_text=batch.get("task", ""),
-            actions=None,
-        )
-
-        input_len = padded_outs["input_ids"].shape[1]
-
-        # initialize grammar
-        xgr_logits_processor = xgr.contrib.hf.LogitsProcessor(self.compiled_grammar)
-
-        # Model inference on GPU (no gradient)
-        output_tokens = self.vlm.generate(
-            input_ids=padded_outs["input_ids"],
-            attention_mask=padded_outs["attention_mask"],
-            pixel_values=padded_outs["pixel_values"],
-            pixel_attention_mask=padded_outs["pixel_attention_mask"],
-            use_cache=self.config.use_cache,
-            max_new_tokens=self.config.max_decoding_steps,
-            do_sample=False,
-            num_beams=1,
-            eos_token_id=self.eos_token_id,
-            pad_token_id=self.pad_token_id,
-            logits_processor=[xgr_logits_processor],
-        )
-
-        # Slice to generated part
-        action_tokens = output_tokens[:, input_len:]
-
-        # Remove padding/eos tokens efficiently on GPU
-        valid_mask = (action_tokens != self.eos_token_id) & (action_tokens != self.pad_token_id)
-        # Replace invalid tokens with pad (or zero) for decoding
-        action_tokens = torch.where(valid_mask, action_tokens, torch.tensor(self.pad_token_id, device=device))
-
-        # Decode in batch (vectorized)
-        # Decode all at once instead of Python loop
-        decoded_texts = self.processor.batch_decode(action_tokens, skip_special_tokens=True)
-
-        # Convert decoded strings to numeric actions (vectorized)
-        final_actions = []
-        n_expected = self.action_horizon * self.action_dim
-        n_bins = self.config.n_state_bins
-
-        for text in decoded_texts:
-            actions = text.strip().split()
-            if len(actions) != n_expected or not all(a.isdigit() and 0 <= int(a) < n_bins for a in actions):
-                final_actions.append(torch.zeros(n_expected, device=device, dtype=torch.long))
-            else:
-                final_actions.append(torch.tensor([int(a) for a in actions], device=device))
-
-        discretized_actions = torch.stack(final_actions, dim=0).reshape(batch_size, -1, self.action_dim)
-
-        # Assuming same bin setup
-        bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)
-
-        # Compute bin centers (midpoints between edges)
-        bin_centers = 0.5 * (bins[:-1] + bins[1:])  # shape: [n_state_bins]
-
-        # Map discretized indices back to continuous states
-        reconstructed_actions = bin_centers[discretized_actions.clamp(0, self.config.n_state_bins - 1)]
-        if self.config.relative_actions:
-            reconstructed_actions += batch[OBS_STATE].unsqueeze(1)
-        return reconstructed_actions
-
-
-class VLA0Client(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.config = config
-
-        self.action_horizon = self.config.chunk_size
-        self.action_dim = self.config.action_feature.shape[0]
-        self.image_keys = self.config.image_features.keys()
-        self.do_crop = config.crop_shape is not None
-        if self.do_crop:
-            self.center_crop_fn = CenterCrop(config.crop_shape)
-
-        self.model_name = "vla-0-smol"
-
-        total_actions = self.config.chunk_size * self.config.action_feature.shape[0]
-        self.grammar_str = build_exact_n_numbers_grammar(total_actions, 0, self.config.n_action_bins)
-
-        # Dummy param for device management
-        self.register_buffer("dummy_param", torch.empty(0))
-
-    def forward(self, batch):
-        raise NotImplementedError("Client backend cannot be trained. Use use_vllm_client=False.")
-
-    def _process_image_to_base64(self, tensor_img: Tensor, format="PNG") -> str:
-        """
-        Converts a (C, H, W) float tensor to a Base64 encoded string.
-        """
-        if self.do_crop:
-            tensor_img = self.center_crop_fn(tensor_img)
-
-        nd_arr = tensor_img.permute(1, 2, 0).cpu().numpy()
-        nd_arr = (nd_arr * 255).astype(np.uint8)
-
-        pil_img = Image.fromarray(nd_arr)
-        buff = io.BytesIO()
-        if format == "PNG":
-            pil_img.save(buff, format="PNG", optimize=True) 
-        else:
-            pil_img.save(buff, format="JPEG", quality=95)
-        return base64.b64encode(buff.getvalue()).decode('utf-8')
-
-    async def _generate_actions_async(self, batch: dict[str, Tensor]) -> Tensor:
-        device = self.dummy_param.device
-        batch_size = batch[OBS_STATE].shape[0]
-        
-        bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)
-
-        if SERVER_PROFILE:
-            start_resp = requests.post(f"{self.config.vllm_url}/start_profile")
-
-        async with AsyncOpenAI(
-            base_url=self.config.vllm_url + "v1",
-            api_key=self.config.vllm_api_key,
-            max_retries=0, 
-            timeout=30.0,
-        ) as client:
-            sem = asyncio.Semaphore(64)
-
-            async def process_single_sample_async(i):
-                async with sem:
-                    state = batch[OBS_STATE][i]
-                    disc_state = (torch.bucketize(state, bins[:-1]) - 1).cpu().numpy()
-                    state_str = " ".join(map(str, disc_state.tolist()))
-
-                    task_text = batch.get("task", [""]*batch_size)[i]
-                    task_cleaned = task_text.lower().strip().replace("_", " ")
-
-                    if self.config.use_state:
-                        prompt_text = f"Task: {task_cleaned}, State: {state_str}, Actions: "
-                    else:
-                        prompt_text = f"Task: {task_cleaned}, Actions: "
-
-                    content_payload = []
-                    present_img_keys = [k for k in self.image_keys if k in batch]
-                    for key in present_img_keys:
-                        b64_str = self._process_image_to_base64(batch[key][i])
-                        content_payload.append({
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{b64_str}"}
-                        })
-                    content_payload.append({"type": "text", "text": prompt_text})
-
-                    try:
-                        response = await client.chat.completions.create(
-                            model=self.model_name,
-                            messages=[{"role": "user", "content": content_payload}],
-                            max_tokens=self.config.max_decoding_steps,
-                            temperature=0.0,
-                            extra_body={"guided_grammar": self.grammar_str}
-                        )
-                        generated_text = response.choices[0].message.content
-                    except Exception as e:
-                        logging.error(f"Async vLLM Error sample {i}: {e}")
-                        raise RuntimeError("vLLM Request Failed")
-
-                    n_expected = self.action_horizon * self.action_dim
-                    actions = generated_text.strip().split()
-                    valid_actions = [int(a) for a in actions if a.isdigit()]
-
-                    if len(valid_actions) != n_expected:
-                        logging.error(actions)
-                        raise RuntimeError(f"Invalid length: {len(valid_actions)} vs {n_expected}")
-
-                    try:
-                        indices = torch.tensor(valid_actions, device=device).clamp(0, self.config.n_action_bins - 1)
-                    except RuntimeError:
-                        logging.error(valid_actions)
-                        raise RuntimeError("Cannot convert digits to indices.")
-
-                    bin_centers = 0.5 * (bins[:-1] + bins[1:])
-                    action_tensor = bin_centers[indices].view(self.action_horizon, self.action_dim)
-
-                    if self.config.relative_actions:
-                        action_tensor = action_tensor + state.unsqueeze(0)
-
-                    return action_tensor
-
-            tasks = [process_single_sample_async(i) for i in range(batch_size)]
-            results = await asyncio.gather(*tasks)
-
-        if SERVER_PROFILE:
-            stop_resp = requests.post(f"{self.config.vllm_url}/stop_profile")
-            exit(0)
-
-        return torch.stack(results)
-
-    async def stream_actions_async(self, batch: dict[str, Tensor]) -> AsyncGenerator[Tensor, None]:
-        """
-        Streams actions one by one as they are generated by the VLM.
-        """
-        device = self.dummy_param.device
-        batch_size = batch[OBS_STATE].shape[0]
-        if batch_size > 1:
-            raise NotImplementedError("Streaming currently supported for batch_size=1 only.")
-
-        bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)
-        bin_centers = 0.5 * (bins[:-1] + bins[1:])
-        
-        state = batch[OBS_STATE][0]
-        disc_state = (torch.bucketize(state, bins[:-1]) - 1).cpu().numpy()
-        state_str = " ".join(map(str, disc_state.tolist()))
-        task_text = batch.get("task", [""])[0]
-        task_cleaned = task_text.lower().strip().replace("_", " ")
-
-        if self.config.use_state:
-            prompt_text = f"Task: {task_cleaned}, State: {state_str}, Actions: "
-        else:
-            prompt_text = f"Task: {task_cleaned}, Actions: "
-
-        content_payload = []
-        present_img_keys = [k for k in self.image_keys if k in batch]
-        for key in present_img_keys:
-            b64_str = self._process_image_to_base64(batch[key][0])
-            content_payload.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64_str}"}
-            })
-        content_payload.append({"type": "text", "text": prompt_text})
-
-        async with AsyncOpenAI(base_url=self.config.vllm_url + "v1", api_key=self.config.vllm_api_key) as client:
-            stream = await client.chat.completions.create(
-                model=self.model_name,
-                messages=[{"role": "user", "content": content_payload}],
-                max_tokens=self.config.max_decoding_steps,
-                temperature=0.0,
-                extra_body={"guided_grammar": self.grammar_str},
-                stream=True
-            )
-
-            current_buffer = ""
-            found_indices = []
-
-            async for chunk in stream:
-                token = chunk.choices[0].delta.content
-                if not token: continue
-                
-                current_buffer += token
-
-                if " " in current_buffer:
-                    parts = current_buffer.split()
-                    # The last part might be an incomplete number (e.g. "12" of "123")
-                    # unless the token ended with a space.
-                    complete_numbers = parts[:-1] if not current_buffer.endswith(" ") else parts
-                    current_buffer = parts[-1] if not current_buffer.endswith(" ") else ""
-
-                    for num_str in complete_numbers:
-                        if num_str.isdigit():
-                            found_indices.append(int(num_str))
-
-                        # Once we have enough indices for one full action
-                        if len(found_indices) == self.action_dim:
-                            idx_tensor = torch.tensor(found_indices, device=device)
-                            action = bin_centers[idx_tensor]
-                            if self.config.relative_actions:
-                                action = action + state
-
-                            yield action.unsqueeze(0)
-                            found_indices = []
-
-    @torch.no_grad()
-    def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
-        return asyncio.run(self._generate_actions_async(batch))
+            raise RuntimeError("vLLM Streaming Failed") from e
