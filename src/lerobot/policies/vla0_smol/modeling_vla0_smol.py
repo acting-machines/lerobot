@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import asyncio
+import contextlib
 import logging
 import queue
 import threading
@@ -21,6 +22,9 @@ try:
     HAS_REMOTE_DEPS = True
 except ImportError:
     HAS_REMOTE_DEPS = False
+
+
+SLEEP_INTERVAL = 0.005
 
 
 class VLA0SmolPolicy(PreTrainedPolicy):
@@ -45,14 +49,19 @@ class VLA0SmolPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
-        if self.config.use_vllm_client:
+        if self.config.use_remote_client:
             logging.info("VLA0 Policy: Initializing in REMOTE CLIENT mode (vLLM).")
             if not HAS_REMOTE_DEPS:
                 raise ImportError("Please install `openai` and `pillow` for remote inference.")
             self.model = VLA0Client(config)
-            self.service = AsyncInferenceService(self.model)
+            if self.config.use_remote_streaming:
+                self.service = AsyncInferenceService(self.model)
         else:
             logging.info("VLA0 Policy: Initializing in LOCAL TRAINING mode (PyTorch).")
+
+            if self.config.use_remote_streaming:
+                raise ValueError("Remote streaming can only be used with remote client.")
+
             self.model = VLA0Local(config)
 
         self.use_ensembling = self.config.ensemble_size > 1
@@ -74,8 +83,13 @@ class VLA0SmolPolicy(PreTrainedPolicy):
         self._action_queue = deque([], maxlen=self.config.n_action_steps)
         self.should_run_model = True
 
+        self._stream_step_counter = 0
+
         if self.use_ensembling:
             self.temporal_ensembler.reset()
+
+        if self.config.use_remote_streaming:
+            self.service.reset()
 
     def get_optim_params(self) -> dict:
         return self.model.parameters()
@@ -87,12 +101,12 @@ class VLA0SmolPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        if self.config.use_vllm_client:
-            return self.select_action_remote(batch)
+        if self.config.use_remote_client and self.config.use_remote_streaming:
+            return self.select_action_remote_streaming(batch)
         else:
-            return self.select_action_local(batch)
+            return self.select_action_common(batch)
 
-    def select_action_local(self, batch: dict[str, Tensor]) -> Tensor:
+    def select_action_common(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
 
         This method wraps `select_actions` in order to return one action at a time for execution in the
@@ -122,28 +136,38 @@ class VLA0SmolPolicy(PreTrainedPolicy):
                 self._action_queue.extend(actions.transpose(0, 1))
             return self._action_queue.popleft()
 
-    def select_action_remote(self, batch: dict[str, Tensor]) -> Tensor:
+    def select_action_remote_streaming(self, batch: dict[str, Tensor]) -> Tensor:
         if self.use_ensembling:
             raise NotImplementedError("Ensemble mode not implemented for vLLM client yet.")
 
+        if self.should_run_model:
+            self.service.submit_request(
+                batch,
+                self._streaming_callback,
+            )
+            self.should_run_model = False
+            self._stream_step_counter = 0
+
+        while not self._action_queue:
+            time.sleep(SLEEP_INTERVAL)
+
+        action = self._action_queue.popleft()
+
+        self._stream_step_counter += 1
+        if self._stream_step_counter >= self.config.n_action_steps:
+            self.should_run_model = True
+
+        return action
+
+    def _streaming_callback(self, stream_item):
+        if isinstance(stream_item, (tuple, list)) and len(stream_item) == 2:
+            idx, action = stream_item
         else:
-            if self.should_run_model:
-                self.service.submit_request(
-                    batch,
-                    lambda action: self._action_queue.append(action),
-                )
+            idx, action = -1, stream_item
 
-            while not self._action_queue:
-                time.sleep(0.01)
-
-            idx, action = self._action_queue.popleft()
-            while idx >= self.config.n_action_steps:
-                while not self._action_queue:
-                    time.sleep(0.01)
-
-                idx, action = self._action_queue.popleft()
-            self.should_run_model = idx >= self.config.n_action_steps - 1
-            return action
+        # Only append if valid tensor
+        if isinstance(action, Tensor) and (idx == -1 or idx < self.config.n_action_steps):
+            self._action_queue.append(action)
 
     def forward(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         loss_dict = self.model.forward(batch)
@@ -160,15 +184,20 @@ class AsyncInferenceService:
         self.thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.thread.start()
 
-    def submit_request(self, batch, callback):
-        """
-        callback: A function that takes ONE action tensor and saves it.
-        """
+    def reset(self) -> None:
         try:
-            self.request_queue.put_nowait((batch, callback))
-            return True
-        except queue.Full:
-            return False
+            while not self.request_queue.empty():
+                self.request_queue.get_nowait()
+        except queue.Empty:
+            pass
+        self._stop_event.clear()
+
+    def submit_request(self, batch, callback) -> None:
+        # Put the last request into the queue, discarding any previous one
+        if self.request_queue.full():
+            with contextlib.suppress(queue.Empty):
+                self.request_queue.get_nowait()
+        self.request_queue.put_nowait((batch, callback))
 
     def _worker_loop(self):
         loop = asyncio.new_event_loop()
@@ -176,7 +205,7 @@ class AsyncInferenceService:
 
         while not self._stop_event.is_set():
             try:
-                batch, callback = self.request_queue.get(timeout=1.0)
+                batch, callback = self.request_queue.get(timeout=SLEEP_INTERVAL)
                 loop.run_until_complete(self._stream_task(batch, callback))
             except queue.Empty:
                 continue
