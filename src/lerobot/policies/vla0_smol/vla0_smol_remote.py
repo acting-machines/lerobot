@@ -220,7 +220,8 @@ class VLA0Client(nn.Module):
                             action_idx += 1
                             found_indices = []
 
-            # Handle any remaining buffer after stream ends
+            # Handle any remaining buffer after stream ends because
+            # the last token may not end with space
             complete_numbers = current_buffer.split()
 
             for num_str in complete_numbers:
