@@ -119,7 +119,7 @@ class VLA0Local(nn.Module):
         self,
         states: torch.Tensor,
         images: torch.Tensor,
-        lang_text: str,
+        prefix_text: list[str],
         actions: torch.Tensor | None,
     ):
         device = states.device
@@ -127,12 +127,6 @@ class VLA0Local(nn.Module):
 
         # Precompute bin edges on GPU
         bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)[:-1]
-
-        # Discretize directly on GPU
-        discretized_states = torch.bucketize(states, bins) - 1  # shape: [B, state_dim]
-
-        # Move the batched results to CPU only once for string formatting
-        disc_states_cpu = discretized_states.detach().cpu().numpy()
 
         if actions is None:
             disc_actions_cpu = [""] * batch_size
@@ -144,15 +138,7 @@ class VLA0Local(nn.Module):
 
         # Build strings in batch
         prompts = []
-        for txt, disc_st, act in zip(lang_text, disc_states_cpu, disc_actions_cpu, strict=False):
-            task_cleaned = txt.lower().strip().replace("_", " ")
-            state_str = " ".join(map(str, disc_st.tolist()))
-
-            if self.config.use_state:
-                prefix = f"Task: {task_cleaned}, State: {state_str}, Actions: "
-            else:
-                prefix = f"Task: {task_cleaned}, Actions: "
-
+        for prefix, act in zip(prefix_text, disc_actions_cpu, strict=False):
             messages = [
                 {
                     "role": "user",
@@ -213,13 +199,13 @@ class VLA0Local(nn.Module):
         self,
         states: torch.Tensor,
         images: torch.Tensor,
-        lang_text: str,
+        prefix_text: list[str],
         actions: torch.Tensor | None = None,
     ):
         device = states.device
 
         prefix_out = self.create_prefix_tokens(
-            states=states, images=images, lang_text=lang_text, actions=actions
+            states=states, images=images, prefix_text=prefix_text, actions=actions
         )
         prefix_out = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in prefix_out.items()}
 
@@ -258,7 +244,7 @@ class VLA0Local(nn.Module):
             padded_outs, loss_mask = self.create_input_tokens(
                 states=batch[OBS_STATE],
                 images=images,
-                lang_text=batch.get("task", ""),
+                prefix_text=batch["prefix"],
                 actions=batch[ACTION],
             )
 
@@ -370,7 +356,7 @@ class VLA0Local(nn.Module):
         padded_outs, _ = self.create_input_tokens(
             states=batch[OBS_STATE],
             images=images,
-            lang_text=batch.get("task", ""),
+            prefix_text=batch["prefix"],
             actions=None,
         )
 

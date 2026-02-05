@@ -64,20 +64,11 @@ class VLA0Client(nn.Module):
             pil_img.save(buff, format="JPEG", quality=95)
         return base64.b64encode(buff.getvalue()).decode("utf-8")
 
-    async def _build_prompt_payload(self, batch, index, bins):
+    async def _build_prompt_payload(self, batch, index):
         loop = asyncio.get_running_loop()
 
         state = batch[OBS_STATE][index]
-        disc_state = (torch.bucketize(state, bins[:-1]) - 1).cpu().numpy()
-        state_str = " ".join(map(str, disc_state.tolist()))
-
-        task_text = batch.get("task", [""] * batch[OBS_STATE].shape[0])[index]
-        task_cleaned = task_text.lower().strip().replace("_", " ")
-
-        if self.config.use_state:
-            prompt_text = f"Task: {task_cleaned}, State: {state_str}, Actions: "
-        else:
-            prompt_text = f"Task: {task_cleaned}, Actions: "
+        prompt_text = batch["prefix"][index]
 
         content_payload = []
         present_img_keys = [k for k in self.image_keys if k in batch]
@@ -115,7 +106,7 @@ class VLA0Client(nn.Module):
 
             async def process_single_sample_async(i):
                 # Build payload (images encoded in background threads)
-                content_payload, state = await self._build_prompt_payload(batch, i, bins)
+                content_payload, state = await self._build_prompt_payload(batch, i)
 
                 async with sem:
                     try:
@@ -172,7 +163,7 @@ class VLA0Client(nn.Module):
         bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)
         bin_centers = 0.5 * (bins[:-1] + bins[1:])
 
-        content_payload, state = await self._build_prompt_payload(batch, 0, bins)
+        content_payload, state = await self._build_prompt_payload(batch, 0)
 
         async with AsyncOpenAI(
             base_url=self.config.vllm_url + "v1",
