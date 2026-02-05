@@ -1,5 +1,5 @@
-import random
 import copy
+import random
 
 import torch
 import xgrammar as xgr
@@ -7,14 +7,13 @@ from torch import Tensor, nn
 from torch.profiler import record_function
 from torchvision.transforms import CenterCrop, RandomCrop
 from transformers import AutoModelForImageTextToText, AutoProcessor
-from transformers.models.smolvlm.image_processing_smolvlm_fast import SmolVLMImageProcessorFast
 from transformers.cache_utils import Cache, DynamicCache
+from transformers.models.smolvlm.image_processing_smolvlm_fast import SmolVLMImageProcessorFast
 
 from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
+from lerobot.policies.vla0_smol.draft_model import EagleModel
 from lerobot.policies.vla0_smol.monkey_patch import patch_SmolVLM_amp, patch_SmolVLMProcessor
 from lerobot.policies.vla0_smol.vla0_smol_common import EPS, build_exact_n_numbers_grammar
-from lerobot.policies.vla0_smol.draft_model import EagleModel
-
 from lerobot.utils.constants import ACTION, OBS_STATE
 
 PRECISION = {
@@ -85,14 +84,16 @@ class VLA0Local(nn.Module):
         self.new_obs = True
 
         # multi-token prediction
-        self.train_mtp = True if config.num_train_eagle_heads > 0 else False
-        self.inference_mtp = True if config.num_inference_eagle_heads > 0 else False
+        self.train_mtp = config.num_train_eagle_heads > 0
+        self.inference_mtp = config.num_inference_eagle_heads > 0
 
         if self.train_mtp:
-            self.eagle_model = EagleModel(num_heads=self.config.num_train_eagle_heads,
-                                          config=self.vlm.model.text_model.config,
-                                          input_embedding=self.vlm.get_input_embeddings(),
-                                          output_embedding=self.vlm.get_output_embeddings())
+            self.eagle_model = EagleModel(
+                num_heads=self.config.num_train_eagle_heads,
+                config=self.vlm.model.text_model.config,
+                input_embedding=self.vlm.get_input_embeddings(),
+                output_embedding=self.vlm.get_output_embeddings(),
+            )
 
     def apply_action_masking(self, actions: list[list[str]]):
         if not self.training:
@@ -301,13 +302,14 @@ class VLA0Local(nn.Module):
             return loss_dict
 
         with record_function("mtp_loss"):
-
             base_hidden_states = [outputs.hidden_states[id] for id in self.config.eagle_layers_ids]
             fused_hidden_state = self.eagle_model.fuse_base_model_hidden_states(base_hidden_states)[:, :-1, :]
 
-            mtp_losses = self.eagle_model.calculate_mtp_loss(input_ids=padded_outs["input_ids"][:, 1:],
-                                                             hidden_states=fused_hidden_state,
-                                                             loss_mask=loss_mask[:, 1:])
+            mtp_losses = self.eagle_model.calculate_mtp_loss(
+                input_ids=padded_outs["input_ids"][:, 1:],
+                hidden_states=fused_hidden_state,
+                loss_mask=loss_mask[:, 1:],
+            )
             mtp_loss = sum(mtp_losses)
 
             loss = vlm_loss + mtp_loss
@@ -321,18 +323,18 @@ class VLA0Local(nn.Module):
 
         return loss_dict
 
-    def generate_next_token(self,
-                            input_ids,
-                            past_key_values):
+    def generate_next_token(self, input_ids, past_key_values):
         with torch.inference_mode():
-            out = self.vlm(input_ids=input_ids,
-                           past_key_values=past_key_values,
-                           output_hidden_states=True,
-                           use_cache=True)
+            out = self.vlm(
+                input_ids=input_ids,
+                past_key_values=past_key_values,
+                output_hidden_states=True,
+                use_cache=True,
+            )
         generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
         return generated_token, out
 
-    def check_end_of_generation(self, generated_token = None):
+    def check_end_of_generation(self, generated_token=None):
         if generated_token is not None:
             for i, token in enumerate(generated_token):
                 if self.generation_finished[i]:
@@ -340,9 +342,7 @@ class VLA0Local(nn.Module):
                 elif token == self.eos_token_id or token == self.pad_token_id:
                     self.generation_finished[i] = True
 
-        if sum(self.generation_finished) == len(self.generation_finished):
-            return True
-        return False
+        return sum(self.generation_finished) == len(self.generation_finished)
 
     def reconstruct_actions(self, decoded_actions, batch):
         batch_size = batch[OBS_STATE].shape[0]
@@ -360,7 +360,7 @@ class VLA0Local(nn.Module):
         reconstructed_actions = bin_centers[discretized_actions.clamp(0, self.config.n_state_bins - 1)]
         if self.config.relative_actions:
             reconstructed_actions += batch[OBS_STATE].unsqueeze(1)
-        
+
         return reconstructed_actions
 
     def prefill(self, batch):
@@ -381,22 +381,20 @@ class VLA0Local(nn.Module):
             device=padded_outs["input_ids"].device,
             dtype=padded_outs["input_ids"].dtype,
         )
-        self.input_ids[:, :self.prefix_len] = padded_outs["input_ids"][:,1:]
+        self.input_ids[:, : self.prefix_len] = padded_outs["input_ids"][:, 1:]
 
         with torch.inference_mode():
-            out = self.vlm(**padded_outs,
-                           use_cache=True,
-                           output_hidden_states=True)
+            out = self.vlm(**padded_outs, use_cache=True, output_hidden_states=True)
 
         generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
         return generated_token, out
-        
+
     def initialise_new_generation(self, batch):
         batch_size = batch[OBS_STATE].shape[0]
 
         self.new_obs = False
         self.generation_batch = batch
-        self.generation_finished = [False]*batch_size
+        self.generation_finished = [False] * batch_size
         self.action_index = 0
         self.input_idx_base = 0
         self.input_idx_eagle = 0
@@ -406,8 +404,8 @@ class VLA0Local(nn.Module):
         device = batch[OBS_STATE].device
         batch_size = batch[OBS_STATE].shape[0]
 
-        next_action_is_generated = [False]*batch_size
-        decoded_actions = [None]*batch_size
+        next_action_is_generated = [False] * batch_size
+        decoded_actions = [None] * batch_size
 
         if self.new_obs:
             self.initialise_new_generation(batch)
@@ -418,11 +416,11 @@ class VLA0Local(nn.Module):
             self.input_idx_base = self.prefix_len
             self.input_idx_eagle = 0
 
-            self.input_ids[:, self.input_ids_len:self.input_ids_len + 1] = generated_token
+            self.input_ids[:, self.input_ids_len : self.input_ids_len + 1] = generated_token
             self.input_ids_len += 1
 
             self.past_key_values = output.past_key_values
-            
+
             if self.inference_mtp:
                 self.eagle_past_key_values = DynamicCache(config=self.eagle_model.cfg)
                 base_hidden_states = [output.hidden_states[id] for id in self.config.eagle_layers_ids]
@@ -430,14 +428,16 @@ class VLA0Local(nn.Module):
 
         # generate one action
         eagle_heads = self.config.num_inference_eagle_heads if self.inference_mtp else 0
-        max_remained_steps = int((self.config.max_decoding_steps - (self.input_ids_len - self.prefix_len)) / (eagle_heads + 1))
+        max_remained_steps = int(
+            (self.config.max_decoding_steps - (self.input_ids_len - self.prefix_len)) / (eagle_heads + 1)
+        )
         for _ in range(max_remained_steps):
             generated_token, out = self.generate_next_token(
-                input_ids=self.input_ids[:, self.input_idx_base:self.input_ids_len],
+                input_ids=self.input_ids[:, self.input_idx_base : self.input_ids_len],
                 past_key_values=self.past_key_values,
             )
             self.input_idx_base = self.input_ids_len
-            self.input_ids[:, self.input_ids_len:self.input_ids_len + 1] = generated_token
+            self.input_ids[:, self.input_ids_len : self.input_ids_len + 1] = generated_token
             self.input_ids_len += 1
 
             self.check_end_of_generation(generated_token)
@@ -445,36 +445,39 @@ class VLA0Local(nn.Module):
             if self.inference_mtp:
                 base_hidden_states = [out.hidden_states[id] for id in self.config.eagle_layers_ids]
                 fused_hidden_state = self.eagle_model.fuse_base_model_hidden_states(base_hidden_states)
-                self.hidden_state = torch.cat([self.hidden_state, fused_hidden_state], dim = 1)           
-
+                self.hidden_state = torch.cat([self.hidden_state, fused_hidden_state], dim=1)
 
             for head_id in range(self.config.num_inference_eagle_heads):
                 if head_id == 0:
                     generated_token, out = self.eagle_model.generate_next_token(
-                        input_ids=self.input_ids[:, self.input_idx_eagle:self.input_ids_len],
+                        input_ids=self.input_ids[:, self.input_idx_eagle : self.input_ids_len],
                         hidden_states=self.hidden_state,
                         past_key_values=self.eagle_past_key_values,
                     )
-                    local_eagle_past_key_values = Cache(layers=[copy.copy(layer) for layer in self.eagle_past_key_values.layers])
+                    local_eagle_past_key_values = Cache(
+                        layers=[copy.copy(layer) for layer in self.eagle_past_key_values.layers]
+                    )
                     self.input_idx_eagle = self.input_ids_len
                 else:
                     generated_token, out = self.eagle_model.generate_next_token(
-                        input_ids=self.input_ids[:, self.input_ids_len - 1:self.input_ids_len],
-                        hidden_states=out.last_hidden_state[:,-1:,:],
+                        input_ids=self.input_ids[:, self.input_ids_len - 1 : self.input_ids_len],
+                        hidden_states=out.last_hidden_state[:, -1:, :],
                         past_key_values=local_eagle_past_key_values,
                     )
-                    self.hidden_state = torch.empty((batch_size,0,self.hidden_state.shape[2]),
-                                                    dtype=self.hidden_state.dtype,
-                                                    device=self.hidden_state.device)
-                self.input_ids[:, self.input_ids_len:self.input_ids_len + 1] = generated_token
+                    self.hidden_state = torch.empty(
+                        (batch_size, 0, self.hidden_state.shape[2]),
+                        dtype=self.hidden_state.dtype,
+                        device=self.hidden_state.device,
+                    )
+                self.input_ids[:, self.input_ids_len : self.input_ids_len + 1] = generated_token
                 self.input_ids_len += 1
                 self.check_end_of_generation(generated_token)
-            
-            # decode every new sequence and count amount of spaces 
+
+            # decode every new sequence and count amount of spaces
             decoded_texts = self.processor.batch_decode(
-                self.input_ids[:, self.prefix_len:self.input_ids_len],
+                self.input_ids[:, self.prefix_len : self.input_ids_len],
                 skip_special_tokens=True,
-            ) # return list of lists
+            )  # return list of lists
             for i in range(batch_size):
                 if next_action_is_generated[i]:
                     continue
@@ -487,11 +490,13 @@ class VLA0Local(nn.Module):
                     decoded_actions[i] = torch.zeros(self.action_dim, device=device, dtype=torch.long)
 
                 # check if we finished next action generation
-                if self.generation_finished[i] or len(output) > self.action_dim*(self.action_index + 1):
+                if self.generation_finished[i] or len(output) > self.action_dim * (self.action_index + 1):
                     next_action_is_generated[i] = True
-                    action_text = output[self.action_dim*(self.action_index):self.action_dim*(self.action_index + 1)]
+                    action_text = output[
+                        self.action_dim * (self.action_index) : self.action_dim * (self.action_index + 1)
+                    ]
                     decoded_actions[i] = torch.tensor([int(a) for a in action_text], device=device)
-            
+
             if sum(next_action_is_generated) == len(next_action_is_generated):
                 self.action_index += 1
                 if self.action_index == self.config.n_action_steps:

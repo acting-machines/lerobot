@@ -120,7 +120,7 @@ class VLA0SmolPolicy(PreTrainedPolicy):
             return self.temporal_ensembler.update(actions)
         elif self.config.use_streaming:
             next_action = self.model.generate_one_action(batch).squeeze(1)
-            return next_action 
+            return next_action
         else:
             # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
             # querying the policy.

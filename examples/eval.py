@@ -68,11 +68,10 @@ for step in tqdm(range(100)):
     optimizer.step()
     optimizer.zero_grad()
 
-    print(f"step: {step} loss: {vlm_loss:.3f}"
-          f" eagle_loss: {eagle_loss:.3f}")
+    print(f"step: {step} loss: {vlm_loss:.3f} eagle_loss: {eagle_loss:.3f}")
 
 # %% [markdown]
-# 
+#
 
 # %%
 decoded_actions = policy.model.generate_actions(batch)
@@ -81,5 +80,3 @@ decoded_actions = postprocessor(decoded_actions)
 # %%
 error: torch.tensor = torch.sqrt((decoded_actions.detach().cpu() - raw_batch["action"].detach().cpu()) ** 2)
 print(f"RMSE {(error.mean(dim=1)).tolist()}")
-
-
