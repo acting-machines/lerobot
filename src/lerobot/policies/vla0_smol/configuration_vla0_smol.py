@@ -65,9 +65,9 @@ class VLA0SmolConfig(PreTrainedConfig):
     action_mask_aug_per: float = 0.1
     action_mask_skip_per: float = 0.1
 
-    num_train_eagle_heads: int = 5
-    num_inference_eagle_heads: int = 5
-    eagle_layers_ids: tuple[int, int, int] = (1, 17, 30)
+    num_train_mtp_heads: int = 5
+    num_inference_mtp_heads: int = 5
+    mtp_layers_ids: tuple[int, int, int] = (1, 17, 30)
 
     # Image crop parameters
     crop_shape: tuple[int, int] | None = None

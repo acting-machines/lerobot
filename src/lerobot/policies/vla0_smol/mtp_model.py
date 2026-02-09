@@ -16,7 +16,7 @@ def shift_right(tensor):
     return tensor
 
 
-class EagleModel(nn.Module):
+class MTPModel(nn.Module):
     def __init__(
         self, num_heads: int, config: LlamaConfig, input_embedding: nn.Module, output_embedding: nn.Module
     ):
@@ -116,10 +116,6 @@ class EagleModel(nn.Module):
 
         losses = []
         for head_idx in range(0, self.num_heads):
-            inputs_embeds = self.embed_tokens(input_ids)  # [B, seq_len, hidden_size]
-            hidden_states = torch.cat((hidden_states, inputs_embeds), dim=-1)  # [B, seq_len, 2*hidden_size]
-            hidden_states = self.fuse_hidden_and_embed(hidden_states)  # [B, seq_len, hidden_size]
-
             if head_idx == 0:
                 block_attention_shape = (batch_size, 1, seq_len, seq_len)
                 causal_mask = torch.tril(torch.ones((seq_len, seq_len), dtype=torch.bool, device=device))
@@ -133,25 +129,26 @@ class EagleModel(nn.Module):
                 attention_mask = torch.cat([attention_mask, next_attention_block], dim=-1)
 
             position_ids = torch.arange(head_idx, input_ids.shape[1] + head_idx, device=device).unsqueeze(0)
-            position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-            hidden_states_out = self.decoder_layer(
-                hidden_states,
+            out = self.forward(
+                input_ids=input_ids,
+                hidden_states=hidden_states,
                 attention_mask=attention_mask,
-                position_embeddings=position_embeddings,
+                position_ids=position_ids,
                 past_key_values=past_key_values,
                 use_cache=True,
             )
-
+            hidden_states_out = out.last_hidden_state
             logits = self.lm_head(self.norm(hidden_states_out))[:, :-1, :]  # [B, seq_len - 1, vocab_size]
+
             targets = input_ids[:, 1:].to(device)  # [B, seq_len - 1]
 
             head_loss = loss_fct(logits.reshape(-1, logits.shape[-1]), targets.reshape(-1))
 
-            loss_mask_eagle = loss_mask[:, 1:].to(device)  # [B, seq_len - 1]
+            loss_mask_mtp = loss_mask[:, 1:].to(device)  # [B, seq_len - 1]
 
-            head_loss = head_loss * loss_mask_eagle.reshape(-1)
-            head_loss = head_loss.sum() / torch.clamp(loss_mask_eagle.sum(), min=1)
+            head_loss = head_loss * loss_mask_mtp.reshape(-1)
+            head_loss = head_loss.sum() / torch.clamp(loss_mask_mtp.sum(), min=1)
 
             losses.append(head_loss)
 

@@ -11,8 +11,8 @@ from transformers.cache_utils import Cache, DynamicCache
 from transformers.models.smolvlm.image_processing_smolvlm_fast import SmolVLMImageProcessorFast
 
 from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
-from lerobot.policies.vla0_smol.draft_model import EagleModel
 from lerobot.policies.vla0_smol.monkey_patch import patch_SmolVLM_amp, patch_SmolVLMProcessor
+from lerobot.policies.vla0_smol.mtp_model import MTPModel
 from lerobot.policies.vla0_smol.vla0_smol_common import EPS, build_exact_n_numbers_grammar
 from lerobot.utils.constants import ACTION, OBS_STATE
 
@@ -84,12 +84,12 @@ class VLA0Local(nn.Module):
         self.new_obs = True
 
         # multi-token prediction
-        self.train_mtp = config.num_train_eagle_heads > 0
-        self.inference_mtp = config.num_inference_eagle_heads > 0
+        self.train_mtp = config.num_train_mtp_heads > 0
+        self.inference_mtp = config.num_inference_mtp_heads > 0
 
         if self.train_mtp:
-            self.eagle_model = EagleModel(
-                num_heads=self.config.num_train_eagle_heads,
+            self.mtp_model = MTPModel(
+                num_heads=self.config.num_train_mtp_heads,
                 config=self.vlm.model.text_model.config,
                 input_embedding=self.vlm.get_input_embeddings(),
                 output_embedding=self.vlm.get_output_embeddings(),
@@ -288,10 +288,10 @@ class VLA0Local(nn.Module):
             return loss_dict
 
         with record_function("mtp_loss"):
-            base_hidden_states = [outputs.hidden_states[id] for id in self.config.eagle_layers_ids]
-            fused_hidden_state = self.eagle_model.fuse_base_model_hidden_states(base_hidden_states)[:, :-1, :]
+            base_hidden_states = [outputs.hidden_states[id] for id in self.config.mtp_layers_ids]
+            fused_hidden_state = self.mtp_model.fuse_base_model_hidden_states(base_hidden_states)[:, :-1, :]
 
-            mtp_losses = self.eagle_model.calculate_mtp_loss(
+            mtp_losses = self.mtp_model.calculate_mtp_loss(
                 input_ids=padded_outs["input_ids"][:, 1:],
                 hidden_states=fused_hidden_state,
                 loss_mask=loss_mask[:, 1:],
@@ -302,7 +302,7 @@ class VLA0Local(nn.Module):
 
             loss_dict = {
                 "vlm_loss": vlm_loss.item(),
-                "eagle_loss": mtp_loss.item(),
+                "mtp_loss": mtp_loss.item(),
                 "loss": loss,
                 "sequence_len": padded_outs["input_ids"].shape[-1],
             }
@@ -383,7 +383,7 @@ class VLA0Local(nn.Module):
         self.generation_finished = [False] * batch_size
         self.action_index = 0
         self.input_idx_base = 0
-        self.input_idx_eagle = 0
+        self.input_idx_mtp = 0
         self.input_ids_len = 0
 
     def generate_one_action(self, batch):
@@ -400,7 +400,7 @@ class VLA0Local(nn.Module):
 
             self.input_ids_len = self.prefix_len
             self.input_idx_base = self.prefix_len
-            self.input_idx_eagle = 0
+            self.input_idx_mtp = 0
 
             self.input_ids[:, self.input_ids_len : self.input_ids_len + 1] = generated_token
             self.input_ids_len += 1
@@ -408,16 +408,38 @@ class VLA0Local(nn.Module):
             self.past_key_values = output.past_key_values
 
             if self.inference_mtp:
-                self.eagle_past_key_values = DynamicCache(config=self.eagle_model.cfg)
-                base_hidden_states = [output.hidden_states[id] for id in self.config.eagle_layers_ids]
-                self.hidden_state = self.eagle_model.fuse_base_model_hidden_states(base_hidden_states)
+                self.mtp_past_key_values = DynamicCache(config=self.mtp_model.cfg)
+                base_hidden_states = [output.hidden_states[id] for id in self.config.mtp_layers_ids]
+                self.hidden_state = self.mtp_model.fuse_base_model_hidden_states(base_hidden_states)
 
         # generate one action
-        eagle_heads = self.config.num_inference_eagle_heads if self.inference_mtp else 0
+        mtp_heads = self.config.num_inference_mtp_heads if self.inference_mtp else 0
         max_remained_steps = int(
-            (self.config.max_decoding_steps - (self.input_ids_len - self.prefix_len)) / (eagle_heads + 1)
+            (self.config.max_decoding_steps - (self.input_ids_len - self.prefix_len)) / (mtp_heads + 1)
         )
         for _ in range(max_remained_steps):
+            for head_id in range(self.config.num_inference_mtp_heads):
+                if head_id == 0:
+                    generated_token, out = self.mtp_model.generate_next_token(
+                        input_ids=self.input_ids[:, self.input_idx_mtp : self.input_ids_len],
+                        hidden_states=self.hidden_state,
+                        past_key_values=self.mtp_past_key_values,
+                    )
+                    local_mtp_past_key_values = Cache(
+                        layers=[copy.copy(layer) for layer in self.mtp_past_key_values.layers]
+                    )
+                    self.input_idx_mtp = self.input_ids_len
+                else:
+                    generated_token, out = self.mtp_model.generate_next_token(
+                        input_ids=self.input_ids[:, self.input_ids_len - 1 : self.input_ids_len],
+                        hidden_states=out.last_hidden_state[:, -1:, :],
+                        past_key_values=local_mtp_past_key_values,
+                    )
+
+                self.input_ids[:, self.input_ids_len : self.input_ids_len + 1] = generated_token
+                self.input_ids_len += 1
+                self.check_end_of_generation(generated_token)
+
             generated_token, out = self.generate_next_token(
                 input_ids=self.input_ids[:, self.input_idx_base : self.input_ids_len],
                 past_key_values=self.past_key_values,
@@ -429,35 +451,8 @@ class VLA0Local(nn.Module):
             self.check_end_of_generation(generated_token)
 
             if self.inference_mtp:
-                base_hidden_states = [out.hidden_states[id] for id in self.config.eagle_layers_ids]
-                fused_hidden_state = self.eagle_model.fuse_base_model_hidden_states(base_hidden_states)
-                self.hidden_state = torch.cat([self.hidden_state, fused_hidden_state], dim=1)
-
-            for head_id in range(self.config.num_inference_eagle_heads):
-                if head_id == 0:
-                    generated_token, out = self.eagle_model.generate_next_token(
-                        input_ids=self.input_ids[:, self.input_idx_eagle : self.input_ids_len],
-                        hidden_states=self.hidden_state,
-                        past_key_values=self.eagle_past_key_values,
-                    )
-                    local_eagle_past_key_values = Cache(
-                        layers=[copy.copy(layer) for layer in self.eagle_past_key_values.layers]
-                    )
-                    self.input_idx_eagle = self.input_ids_len
-                else:
-                    generated_token, out = self.eagle_model.generate_next_token(
-                        input_ids=self.input_ids[:, self.input_ids_len - 1 : self.input_ids_len],
-                        hidden_states=out.last_hidden_state[:, -1:, :],
-                        past_key_values=local_eagle_past_key_values,
-                    )
-                    self.hidden_state = torch.empty(
-                        (batch_size, 0, self.hidden_state.shape[2]),
-                        dtype=self.hidden_state.dtype,
-                        device=self.hidden_state.device,
-                    )
-                self.input_ids[:, self.input_ids_len : self.input_ids_len + 1] = generated_token
-                self.input_ids_len += 1
-                self.check_end_of_generation(generated_token)
+                base_hidden_states = [out.hidden_states[id] for id in self.config.mtp_layers_ids]
+                self.hidden_state = self.mtp_model.fuse_base_model_hidden_states(base_hidden_states)
 
             # decode every new sequence and count amount of spaces
             decoded_texts = self.processor.batch_decode(

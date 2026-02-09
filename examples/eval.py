@@ -62,7 +62,7 @@ for step in tqdm(range(100)):
     # batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
     loss, loss_dict = policy.forward(batch)
     vlm_loss = loss_dict["vlm_loss"]
-    eagle_loss = loss_dict["eagle_loss"]
+    eagle_loss = loss_dict["mtp_loss"]
 
     loss.backward()
     optimizer.step()
@@ -78,5 +78,5 @@ decoded_actions = policy.model.generate_actions(batch)
 decoded_actions = postprocessor(decoded_actions)
 
 # %%
-error: torch.tensor = torch.sqrt((decoded_actions.detach().cpu() - raw_batch["action"].detach().cpu()) ** 2)
+error: torch.Tensor = torch.sqrt((decoded_actions.detach().cpu() - raw_batch["action"].detach().cpu()) ** 2)
 print(f"RMSE {(error.mean(dim=1)).tolist()}")
