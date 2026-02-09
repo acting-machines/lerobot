@@ -54,14 +54,10 @@ class VLA0SmolPolicy(PreTrainedPolicy):
             if not HAS_REMOTE_DEPS:
                 raise ImportError("Please install `openai` and `pillow` for remote inference.")
             self.model = VLA0Client(config)
-            if self.config.use_remote_streaming:
+            if self.config.use_streaming:
                 self.service = AsyncInferenceService(self.model)
         else:
             logging.info("VLA0 Policy: Initializing in LOCAL TRAINING mode (PyTorch).")
-
-            if self.config.use_remote_streaming:
-                raise ValueError("Remote streaming can only be used with remote client.")
-
             self.model = VLA0Local(config)
 
         self.use_ensembling = self.config.ensemble_size > 1
@@ -88,7 +84,7 @@ class VLA0SmolPolicy(PreTrainedPolicy):
         if self.use_ensembling:
             self.temporal_ensembler.reset()
 
-        if self.config.use_remote_streaming:
+        if self.config.use_remote_client and self.config.use_streaming:
             self.service.reset()
 
     def get_optim_params(self) -> dict:
@@ -101,7 +97,7 @@ class VLA0SmolPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        if self.config.use_remote_client and self.config.use_remote_streaming:
+        if self.config.use_remote_client and self.config.use_streaming:
             return self.select_action_remote_streaming(batch)
         else:
             return self.select_action_common(batch)
@@ -122,6 +118,9 @@ class VLA0SmolPolicy(PreTrainedPolicy):
             actions = actions[:, :, :original_action_dim]
 
             return self.temporal_ensembler.update(actions)
+        elif self.config.use_streaming:
+            next_action = self.model.generate_one_action(batch).squeeze(1)
+            return next_action
         else:
             # Action queue logic for n_action_steps > 1. When the action_queue is depleted, populate it by
             # querying the policy.
