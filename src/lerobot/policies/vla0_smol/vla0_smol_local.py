@@ -289,7 +289,9 @@ class VLA0Local(nn.Module):
 
         with record_function("mtp_loss"):
             base_hidden_states = [outputs.hidden_states[id] for id in self.config.mtp_layers_ids]
-            fused_hidden_state = self.mtp_model.fuse_base_model_hidden_states(base_hidden_states)[:, :-1, :]
+            fused_hidden_state = self.mtp_model.project_hidden_states(torch.cat(base_hidden_states, dim=-1))[
+                :, :-1, :
+            ]
 
             mtp_losses = self.mtp_model.calculate_mtp_loss(
                 input_ids=padded_outs["input_ids"][:, 1:],
@@ -410,7 +412,9 @@ class VLA0Local(nn.Module):
             if self.inference_mtp:
                 self.mtp_past_key_values = DynamicCache(config=self.mtp_model.cfg)
                 base_hidden_states = [output.hidden_states[id] for id in self.config.mtp_layers_ids]
-                self.hidden_state = self.mtp_model.fuse_base_model_hidden_states(base_hidden_states)
+                self.hidden_state = self.mtp_model.project_hidden_states(
+                    torch.cat(base_hidden_states, dim=-1)
+                )
 
         # generate one action
         mtp_heads = self.config.num_inference_mtp_heads if self.inference_mtp else 0
@@ -452,7 +456,9 @@ class VLA0Local(nn.Module):
 
             if self.inference_mtp:
                 base_hidden_states = [out.hidden_states[id] for id in self.config.mtp_layers_ids]
-                self.hidden_state = self.mtp_model.fuse_base_model_hidden_states(base_hidden_states)
+                self.hidden_state = self.mtp_model.project_hidden_states(
+                    torch.cat(base_hidden_states, dim=-1)
+                )
 
             # decode every new sequence and count amount of spaces
             decoded_texts = self.processor.batch_decode(
