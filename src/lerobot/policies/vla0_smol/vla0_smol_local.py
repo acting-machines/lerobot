@@ -95,6 +95,16 @@ class VLA0Local(nn.Module):
                 output_embedding=self.vlm.get_output_embeddings(),
             )
 
+            offset = 1
+            num_layers = self.vlm.model.text_model.config.num_hidden_layers
+
+            # Eagle3 uses 3 aux layers from layer 1, num_layers//2, num_layers-4
+            low_aux_layer = 1 + offset
+            mid_aux_layer = num_layers // 2 - 1 + offset
+            last_aux_layer = num_layers - 4 + offset
+            self.mtp_aux_ids = [low_aux_layer, mid_aux_layer, last_aux_layer]
+            print(f"MTP aux layers: {self.mtp_aux_ids}")
+
     def apply_action_masking(self, actions: list[list[str]]):
         if not self.training:
             return actions
@@ -288,7 +298,7 @@ class VLA0Local(nn.Module):
             return loss_dict
 
         with record_function("mtp_loss"):
-            base_hidden_states = [outputs.hidden_states[id] for id in self.config.mtp_layers_ids]
+            base_hidden_states = [outputs.hidden_states[id] for id in self.mtp_aux_ids]
             fused_hidden_state = self.mtp_model.project_hidden_states(torch.cat(base_hidden_states, dim=-1))[
                 :, :-1, :
             ]
@@ -411,7 +421,7 @@ class VLA0Local(nn.Module):
 
             if self.inference_mtp:
                 self.mtp_past_key_values = DynamicCache(config=self.mtp_model.cfg)
-                base_hidden_states = [output.hidden_states[id] for id in self.config.mtp_layers_ids]
+                base_hidden_states = [output.hidden_states[id] for id in self.mtp_aux_ids]
                 self.hidden_state = self.mtp_model.project_hidden_states(
                     torch.cat(base_hidden_states, dim=-1)
                 )
@@ -455,7 +465,7 @@ class VLA0Local(nn.Module):
             self.check_end_of_generation(generated_token)
 
             if self.inference_mtp:
-                base_hidden_states = [out.hidden_states[id] for id in self.config.mtp_layers_ids]
+                base_hidden_states = [out.hidden_states[id] for id in self.mtp_aux_ids]
                 self.hidden_state = self.mtp_model.project_hidden_states(
                     torch.cat(base_hidden_states, dim=-1)
                 )

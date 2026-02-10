@@ -4,7 +4,6 @@ from collections.abc import Callable
 import torch
 from torch import nn
 from transformers.cache_utils import Cache, DynamicCache
-from transformers.integrations import use_kernelized_func
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_layers import GradientCheckpointingLayer
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -19,6 +18,7 @@ from transformers.models.llama.modeling_llama import (
 )
 from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs
+from transformers.utils.deprecation import deprecate_kwarg
 
 
 @torch.no_grad()
@@ -28,7 +28,6 @@ def shift_right(tensor):
     return tensor
 
 
-@use_kernelized_func(apply_rotary_pos_emb)
 class LlamaAttentionMTP(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
@@ -55,16 +54,18 @@ class LlamaAttentionMTP(nn.Module):
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
 
+    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
-        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attention_mask: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
         cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor]:
         input_shape = hidden_states.shape[:-1]
+
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -81,9 +82,9 @@ class LlamaAttentionMTP(nn.Module):
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
 
-        attention_interface: Callable = ALL_ATTENTION_FUNCTIONS.get_interface(
-            self.config._attn_implementation, eager_attention_forward
-        )
+        attention_interface: Callable = eager_attention_forward
+        if self.config._attn_implementation != "eager":
+            attention_interface = ALL_ATTENTION_FUNCTIONS[self.config._attn_implementation]
 
         attn_output, attn_weights = attention_interface(
             self,
@@ -165,7 +166,7 @@ class MTPModel(nn.Module):
 
         self.embed_tokens = input_embedding
         self.midlayer = LlamaDecoderLayerMTP(self.cfg, layer_idx=0)
-        self.fc = nn.Linear(config.hidden_size * 3, config.hidden_size, bias=False)
+        self.fc = nn.Linear(self.cfg.hidden_size * 3, self.cfg.hidden_size)
         self.norm = LlamaRMSNorm(self.cfg.hidden_size, eps=self.cfg.rms_norm_eps)
         self.lm_head = output_embedding
 
@@ -176,7 +177,7 @@ class MTPModel(nn.Module):
 
     def project_hidden_states(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # eagle 3 requires hidden states from 3 layers
-        assert hidden_states.size(-1) == self.config.hidden_size * 3
+        assert hidden_states.size(-1) == self.cfg.hidden_size * 3
         return self.fc(hidden_states)
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
