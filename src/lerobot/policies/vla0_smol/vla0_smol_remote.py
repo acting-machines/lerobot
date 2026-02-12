@@ -34,7 +34,7 @@ class VLA0Client(nn.Module):
         if self.do_crop:
             self.center_crop_fn = CenterCrop(config.crop_shape)
 
-        self.model_name = "vla-0-smol"
+        self.model_name = "/home/olegbalakhnov/vla-0-smol"
 
         total_actions = self.config.chunk_size * self.config.action_feature.shape[0]
         self.grammar_str = build_exact_n_numbers_grammar(total_actions, 0, self.config.n_action_bins)

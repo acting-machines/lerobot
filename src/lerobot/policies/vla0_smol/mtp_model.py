@@ -166,7 +166,7 @@ class MTPModel(nn.Module):
 
         self.embed_tokens = input_embedding
         self.midlayer = LlamaDecoderLayerMTP(self.cfg, layer_idx=0)
-        self.fc = nn.Linear(self.cfg.hidden_size * 3, self.cfg.hidden_size)
+        self.fc = nn.Linear(self.cfg.hidden_size * 3, self.cfg.hidden_size, bias=False)
         self.norm = LlamaRMSNorm(self.cfg.hidden_size, eps=self.cfg.rms_norm_eps)
         self.lm_head = output_embedding
 

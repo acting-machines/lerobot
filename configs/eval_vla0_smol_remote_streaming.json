@@ -7,10 +7,10 @@
     },
     "policy": {
         "type": "vla0_smol",
-        "pretrained_path": "outputs/train/2026-02-01/19-33-52_pusht_vla0_smol/checkpoints/010000/pretrained_model",
+        "pretrained_path": "/home/olegbalakhnov/lerobot/pusht_mtp",
         "vlm_checkpoint": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
         "use_remote_client": true,
-        "use_remote_streaming": true,
+        "use_streaming": true,
         "n_obs_steps": 1,
         "device": "cuda",
         "use_amp": true,
