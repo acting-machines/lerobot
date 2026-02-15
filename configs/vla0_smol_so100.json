@@ -1,0 +1,50 @@
+{
+    "dataset": {
+        "repo_id": "southfreebird/lerobot_test_100"
+    },
+    "policy": {
+        "type": "vla0_smol",
+        "vlm_checkpoint": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+        "n_obs_steps": 1,
+        "device": "cuda",
+        "use_amp": true,
+        "amp_dtype": "bf16",
+        "push_to_hub": false,
+        "chunk_size": 10,
+        "n_action_steps": 5,
+        "optimizer_lr": 0.00005,
+        "optimizer_betas": [
+            0.9,
+            0.95
+        ],
+        "optimizer_eps": 1e-08,
+        "optimizer_weight_decay": 0.01,
+        "scheduler_warmup_steps": 1000,
+        "scheduler_decay_steps": 20000,
+        "scheduler_decay_lr": 5e-06,
+        "precision": "float32",
+        "freeze_vision_encoder": false,
+        "do_image_splitting": false,
+        "drop_n_last_frames": 1,
+        "grad_clip_norm": 1,
+        "relative_actions": false,
+        "use_state": true,
+        "crop_shape": [460, 620],
+        "action_mask_aug_per": 0.15,
+        "action_mask_skip_per": 0.1,
+        "num_train_mtp_heads": 0,
+        "num_inference_mtp_heads": 0
+    },
+    "num_workers": 4,
+    "batch_size": 16,
+    "steps": 20000,
+    "eval_freq": -1,
+    "log_freq": 100,
+    "save_checkpoint": true,
+    "save_freq": 10000,
+    "profile_step_num": -1,
+    "wandb": {
+        "enable": true,
+        "project": "lerobot"
+    }
+}
