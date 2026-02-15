@@ -7,7 +7,7 @@
     },
     "policy": {
         "type": "vla0_smol",
-        "pretrained_path": "/home/olegbalakhnov/lerobot/pusht_mtp",
+        "pretrained_path": "olegbalakhnov/vla-0-smol-test",
         "vlm_checkpoint": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
         "n_obs_steps": 1,
         "device": "cuda",
