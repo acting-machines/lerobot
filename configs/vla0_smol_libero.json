@@ -2,15 +2,13 @@
     "dataset": {
         "repo_id": "HuggingFaceVLA/libero"
     },
-    "env": {
-        "type": "libero",
-        "task": "libero_object"
-    },
     "policy": {
         "type": "vla0_smol",
         "vlm_checkpoint": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
         "n_obs_steps": 1,
         "device": "cuda",
+        "use_amp": true,
+        "amp_dtype": "bf16",
         "push_to_hub": false,
         "chunk_size": 8,
         "n_action_steps": 8,
@@ -34,15 +32,19 @@
             230
         ],
         "relative_actions": false,
-        "use_state": true
+        "use_state": true,
+        "action_mask_aug_per": 0.15,
+        "action_mask_skip_per": 0.1,
+        "num_train_mtp_heads": 5
+
     },
     "num_workers": 8,
-    "batch_size": 16,
+    "batch_size": 24,
     "steps": 100000,
-    "eval_freq": 20000,
+    "eval_freq": 200000,
     "log_freq": 200,
     "save_checkpoint": true,
-    "save_freq": 10000,
+    "save_freq": 20000,
     "profile_step_num": -1,
     "eval": {
         "n_episodes": 16,

@@ -18,7 +18,7 @@ class VLA0SmolConfig(PreTrainedConfig):
     ensemble_size: int = 0
 
     use_remote_client: bool = False
-    use_streaming: bool = True
+    use_streaming: bool = False
     vllm_url: str = "http://localhost:8000/"
     vllm_api_key: str = "EMPTY"
 
