@@ -67,8 +67,6 @@ def resolve_delta_timestamps(
     if len(delta_timestamps) == 0:
         delta_timestamps = None
 
-    print(delta_timestamps)
-
     return delta_timestamps
 
 
