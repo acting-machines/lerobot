@@ -93,6 +93,14 @@ def convert_checkpoint(input_dir: Path, output_dir: Path, base_model_id: str | N
 
     for key, value in state_dict.items():
         new_key = key
+        if key.startswith("model.mtp_model.lm_head"):
+            new_key = key.replace("model.mtp_model.", "")
+            remapped_count += 1
+        elif key.startswith("model.mtp_model.embed_tokens"):
+            new_key = key.replace("model.mtp_model.", "model.text_model.")
+            remapped_count += 1
+        elif key.startswith("model.mtp_model."):
+            continue
 
         if key.startswith("model.vlm."):
             new_key = key.replace("model.vlm.", "")

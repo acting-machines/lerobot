@@ -7,8 +7,11 @@ import queue
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 import torch
+from huggingface_hub.constants import SAFETENSORS_SINGLE_FILE
+from safetensors.torch import save_model as save_model_as_safetensor
 from torch import Tensor
 
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -172,6 +175,16 @@ class VLA0SmolPolicy(PreTrainedPolicy):
         loss_dict = self.model.forward(batch)
         loss = loss_dict.pop("loss")
         return loss, loss_dict
+
+    def _save_pretrained(self, save_directory: Path) -> None:
+        self.config._save_pretrained(save_directory)
+        model_to_save = self.module if hasattr(self, "module") else self
+        save_model_as_safetensor(model_to_save, str(save_directory / SAFETENSORS_SINGLE_FILE))
+
+        # safe MTP model
+        if hasattr(self.model, "mtp_model"):
+            mtp_model = self.model.mtp_model
+            save_model_as_safetensor(mtp_model, str(save_directory / "mtp_model.safetensors"))
 
 
 class AsyncInferenceService:
