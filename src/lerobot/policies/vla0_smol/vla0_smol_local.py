@@ -1,5 +1,6 @@
 import copy
 import random
+import time
 
 import torch
 import xgrammar as xgr
@@ -82,6 +83,9 @@ class VLA0Local(nn.Module):
 
         # stream generation
         self.new_obs = True
+        self.prefill_times_ms: list[float] = []
+        self.generate_one_action_new_obs_true_times_ms: list[float] = []
+        self.generate_one_action_new_obs_false_times_ms: list[float] = []
 
         # multi-token prediction
         self.train_mtp = config.num_train_mtp_heads > 0
@@ -361,7 +365,42 @@ class VLA0Local(nn.Module):
 
         return reconstructed_actions
 
+    def reset_prefill_timing(self):
+        self.prefill_times_ms.clear()
+
+    def get_prefill_timings_ms(self) -> list[float]:
+        return list(self.prefill_times_ms)
+
+    def reset_generate_one_action_timing(self):
+        self.generate_one_action_new_obs_true_times_ms.clear()
+        self.generate_one_action_new_obs_false_times_ms.clear()
+
+    def get_generate_one_action_new_obs_true_timings_ms(self) -> list[float]:
+        return list(self.generate_one_action_new_obs_true_times_ms)
+
+    def get_generate_one_action_new_obs_false_timings_ms(self) -> list[float]:
+        return list(self.generate_one_action_new_obs_false_times_ms)
+
+    @staticmethod
+    def _synchronize_timing_device(device: torch.device) -> None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    def _record_generate_one_action_timing(
+        self, device: torch.device, start_time: float, started_with_new_obs: bool
+    ) -> None:
+        self._synchronize_timing_device(device)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        if started_with_new_obs:
+            self.generate_one_action_new_obs_true_times_ms.append(elapsed_ms)
+        else:
+            self.generate_one_action_new_obs_false_times_ms.append(elapsed_ms)
+
     def prefill(self, batch):
+        timing_device = batch[OBS_STATE].device
+        self._synchronize_timing_device(timing_device)
+        start_time = time.perf_counter()
+
         images = self.prepare_images(batch)
         batch_size = batch[OBS_STATE].shape[0]
 
@@ -385,6 +424,8 @@ class VLA0Local(nn.Module):
             out = self.vlm(**padded_outs, use_cache=True, output_hidden_states=True)
 
         generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
+        self._synchronize_timing_device(generated_token.device)
+        self.prefill_times_ms.append((time.perf_counter() - start_time) * 1000.0)
         return generated_token, out
 
     def initialise_new_generation(self, batch):
@@ -401,6 +442,9 @@ class VLA0Local(nn.Module):
     def generate_one_action(self, batch):
         device = batch[OBS_STATE].device
         batch_size = batch[OBS_STATE].shape[0]
+        started_with_new_obs = self.new_obs
+        self._synchronize_timing_device(device)
+        start_time = time.perf_counter()
 
         next_action_is_generated = [False] * batch_size
         decoded_actions = [None] * batch_size
@@ -498,9 +542,13 @@ class VLA0Local(nn.Module):
                 self.action_index += 1
                 if self.action_index == self.config.n_action_steps:
                     self.new_obs = True
-                return self.reconstruct_actions(decoded_actions, self.generation_batch)
+                result = self.reconstruct_actions(decoded_actions, self.generation_batch)
+                self._record_generate_one_action_timing(device, start_time, started_with_new_obs)
+                return result
 
-        return torch.zeros((batch_size, 1, self.action_dim), device=device, dtype=torch.long)
+        result = torch.zeros((batch_size, 1, self.action_dim), device=device, dtype=torch.long)
+        self._record_generate_one_action_timing(device, start_time, started_with_new_obs)
+        return result
 
     def generate_actions(self, batch: dict[str, torch.Tensor]):
         actions = []
