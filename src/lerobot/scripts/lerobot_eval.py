@@ -99,6 +99,7 @@ def summarize_prefill_timings(prefill_times_ms: list[float]) -> dict[str, float 
     arr = np.array(prefill_times_ms, dtype=float)
     return {
         "avg_prefill_ms": float(np.nanmean(arr)),
+        "p50_prefill_ms": float(np.nanpercentile(arr, 50)),
         "p95_prefill_ms": float(np.nanpercentile(arr, 95)),
         "num_prefill_calls": int(arr.size),
     }
@@ -113,6 +114,7 @@ def summarize_generate_one_action_new_obs_true_timings(
     arr = np.array(generate_one_action_new_obs_true_times_ms, dtype=float)
     return {
         "avg_generate_one_action_new_obs_true_ms": float(np.nanmean(arr)),
+        "p50_generate_one_action_new_obs_true_ms": float(np.nanpercentile(arr, 50)),
         "p95_generate_one_action_new_obs_true_ms": float(np.nanpercentile(arr, 95)),
         "num_generate_one_action_new_obs_true_calls": int(arr.size),
     }
@@ -127,6 +129,7 @@ def summarize_generate_one_action_new_obs_false_timings(
     arr = np.array(generate_one_action_new_obs_false_times_ms, dtype=float)
     return {
         "avg_generate_one_action_new_obs_false_ms": float(np.nanmean(arr)),
+        "p50_generate_one_action_new_obs_false_ms": float(np.nanpercentile(arr, 50)),
         "p95_generate_one_action_new_obs_false_ms": float(np.nanpercentile(arr, 95)),
         "num_generate_one_action_new_obs_false_calls": int(arr.size),
     }
