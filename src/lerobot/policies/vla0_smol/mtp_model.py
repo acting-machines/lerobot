@@ -316,7 +316,7 @@ class MTPModel(nn.Module):
                 cache_position,
                 use_cache,
             )
-            logits = self.compute_logits(output.last_hidden_state)  # [batch_size, seq_len - 1, vocab_size]
-        generated_token = logits[:, -1, :].argmax(-1, keepdim=True)
-
-        return generated_token, output
+            logits = self.lm_head(
+                self.norm(output.last_hidden_state)
+            )  # [batch_size, seq_len - 1, vocab_size]
+        return logits[:, -1, :], output

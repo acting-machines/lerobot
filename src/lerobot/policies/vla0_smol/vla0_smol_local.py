@@ -74,12 +74,16 @@ class VLA0Local(nn.Module):
         self.processor.tokenizer.add_tokens([self.actions_mask_symbol], special_tokens=True)
         self.vlm.resize_token_embeddings(len(self.processor.tokenizer), mean_resizing=False)
         self.mask_token_id = self.processor.tokenizer.convert_tokens_to_ids(self.actions_mask_symbol)
+        self.vocab_size = len(self.processor.tokenizer)
 
         tokenizer_info = xgr.TokenizerInfo.from_huggingface(self.processor.tokenizer)
         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
         total_actions = self.config.chunk_size * self.config.action_feature.shape[0]
         ebnf_string = build_exact_n_numbers_grammar(total_actions, 0, self.config.n_action_bins)
         self.compiled_grammar = self.grammar_compiler.compile_grammar(ebnf_string)
+        self.stop_token_ids = list(
+            {token_id for token_id in [self.eos_token_id, self.pad_token_id] if token_id is not None}
+        )
 
         # stream generation
         self.new_obs = True
@@ -333,8 +337,7 @@ class VLA0Local(nn.Module):
                 output_hidden_states=True,
                 use_cache=True,
             )
-        generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
-        return generated_token, out
+        return out.logits[:, -1, :], out
 
     def check_end_of_generation(self, generated_token=None):
         if generated_token is not None:
@@ -423,10 +426,10 @@ class VLA0Local(nn.Module):
         with torch.inference_mode():
             out = self.vlm(**padded_outs, use_cache=True, output_hidden_states=True)
 
-        generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
-        self._synchronize_timing_device(generated_token.device)
+        logits = out.logits[:, -1, :]
+        self._synchronize_timing_device(logits.device)
         self.prefill_times_ms.append((time.perf_counter() - start_time) * 1000.0)
-        return generated_token, out
+        return logits, out
 
     def initialise_new_generation(self, batch):
         batch_size = batch[OBS_STATE].shape[0]
@@ -438,6 +441,43 @@ class VLA0Local(nn.Module):
         self.input_idx_base = 0
         self.input_idx_mtp = 0
         self.input_ids_len = 0
+        self.grammar_matchers = [
+            xgr.GrammarMatcher(
+                self.compiled_grammar,
+                override_stop_tokens=self.stop_token_ids,
+            )
+            for _ in range(batch_size)
+        ]
+        self.grammar_bitmask = xgr.allocate_token_bitmask(batch_size, self.vocab_size)
+
+    def select_next_grammar_constrained_token(self, logits: torch.Tensor) -> torch.Tensor:
+        constrained_logits = logits.clone()
+
+        for i, matcher in enumerate(self.grammar_matchers):
+            if self.generation_finished[i] or matcher.is_terminated():
+                constrained_logits[i].fill_(float("-inf"))
+                constrained_logits[i, self.pad_token_id] = 0.0
+                continue
+
+            need_apply = matcher.fill_next_token_bitmask(self.grammar_bitmask, index=i)
+            if need_apply:
+                xgr.apply_token_bitmask_inplace(
+                    constrained_logits[i : i + 1],
+                    self.grammar_bitmask[i : i + 1].to(constrained_logits.device),
+                    vocab_size=self.vocab_size,
+                )
+
+        generated_token = constrained_logits.argmax(-1, keepdim=True)
+
+        for i, matcher in enumerate(self.grammar_matchers):
+            if self.generation_finished[i] or matcher.is_terminated():
+                generated_token[i, 0] = self.pad_token_id
+                continue
+
+            if not matcher.accept_token(generated_token[i, 0].item()):
+                raise RuntimeError(f"XGrammar rejected generated token for batch item {i}.")
+
+        return generated_token
 
     def generate_one_action(self, batch):
         device = batch[OBS_STATE].device
@@ -452,7 +492,8 @@ class VLA0Local(nn.Module):
         if self.new_obs:
             self.initialise_new_generation(batch)
 
-            generated_token, output = self.prefill(batch=batch)
+            logits, output = self.prefill(batch=batch)
+            generated_token = self.select_next_grammar_constrained_token(logits)
 
             self.input_ids_len = self.prefix_len
             self.input_idx_base = self.prefix_len
@@ -478,7 +519,7 @@ class VLA0Local(nn.Module):
         for _ in range(max_remained_steps):
             for head_id in range(self.config.num_inference_mtp_heads):
                 if head_id == 0:
-                    generated_token, out = self.mtp_model.generate_next_token(
+                    logits, out = self.mtp_model.generate_next_token(
                         input_ids=self.input_ids[:, self.input_idx_mtp : self.input_ids_len],
                         hidden_states=self.hidden_state,
                         past_key_values=self.mtp_past_key_values,
@@ -488,20 +529,22 @@ class VLA0Local(nn.Module):
                     )
                     self.input_idx_mtp = self.input_ids_len
                 else:
-                    generated_token, out = self.mtp_model.generate_next_token(
+                    logits, out = self.mtp_model.generate_next_token(
                         input_ids=self.input_ids[:, self.input_ids_len - 1 : self.input_ids_len],
                         hidden_states=out.last_hidden_state[:, -1:, :],
                         past_key_values=local_mtp_past_key_values,
                     )
 
+                generated_token = self.select_next_grammar_constrained_token(logits)
                 self.input_ids[:, self.input_ids_len : self.input_ids_len + 1] = generated_token
                 self.input_ids_len += 1
                 self.check_end_of_generation(generated_token)
 
-            generated_token, out = self.generate_next_token(
+            logits, out = self.generate_next_token(
                 input_ids=self.input_ids[:, self.input_idx_base : self.input_ids_len],
                 past_key_values=self.past_key_values,
             )
+            generated_token = self.select_next_grammar_constrained_token(logits)
             self.input_idx_base = self.input_ids_len
             self.input_ids[:, self.input_ids_len : self.input_ids_len + 1] = generated_token
             self.input_ids_len += 1
