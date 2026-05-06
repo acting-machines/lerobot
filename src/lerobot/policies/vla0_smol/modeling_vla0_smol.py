@@ -84,6 +84,9 @@ class VLA0SmolPolicy(PreTrainedPolicy):
 
         self._stream_step_counter = 0
 
+        if hasattr(self.model, "reset"):
+            self.model.reset()
+
         if self.use_ensembling:
             self.temporal_ensembler.reset()
 

@@ -85,8 +85,7 @@ class VLA0Local(nn.Module):
             {token_id for token_id in [self.eos_token_id, self.pad_token_id] if token_id is not None}
         )
 
-        # stream generation
-        self.new_obs = True
+        # stream generation timings
         self.prefill_times_ms: list[float] = []
         self.generate_one_action_new_obs_true_times_ms: list[float] = []
         self.generate_one_action_new_obs_false_times_ms: list[float] = []
@@ -95,7 +94,7 @@ class VLA0Local(nn.Module):
         self.train_mtp = config.num_train_mtp_heads > 0
         self.inference_mtp = config.num_inference_mtp_heads > 0
 
-        if self.train_mtp:
+        if self.train_mtp or self.inference_mtp:
             self.mtp_model = MTPModel(
                 num_heads=self.config.num_train_mtp_heads,
                 config=self.vlm.model.text_model.config,
@@ -112,6 +111,26 @@ class VLA0Local(nn.Module):
             last_aux_layer = num_layers - 4 + offset
             self.mtp_aux_ids = [low_aux_layer, mid_aux_layer, last_aux_layer]
             print(f"MTP aux layers: {self.mtp_aux_ids}")
+
+        self.reset()
+
+    def reset(self) -> None:
+        """Clear any streaming decode state so a new rollout starts from a fresh prompt."""
+        self.new_obs = True
+        self.generation_batch = None
+        self.generation_finished = []
+        self.action_index = 0
+        self.input_idx_base = 0
+        self.input_idx_mtp = 0
+        self.input_ids_len = 0
+        self.prefix_len = 0
+        self.input_ids = None
+        self.past_key_values = None
+        self.hidden_state = None
+        self.grammar_matchers = []
+        self.grammar_bitmask = None
+        if self.inference_mtp:
+            self.mtp_past_key_values = None
 
     def apply_action_masking(self, actions: list[list[str]]):
         if not self.training:
