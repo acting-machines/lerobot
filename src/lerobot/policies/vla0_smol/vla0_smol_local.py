@@ -129,6 +129,9 @@ class VLA0Local(nn.Module):
         self.hidden_state = None
         self.grammar_matchers = []
         self.grammar_bitmask = None
+        self.decoded_action_numbers = []
+        self.pending_action_number_text = []
+        self.invalid_action_generation = []
         if self.inference_mtp:
             self.mtp_past_key_values = None
 
@@ -292,7 +295,7 @@ class VLA0Local(nn.Module):
                 pixel_values=padded_outs["pixel_values"],
                 pixel_attention_mask=padded_outs["pixel_attention_mask"],
                 use_cache=self.config.use_cache,
-                output_hidden_states=True,
+                output_hidden_states=self.train_mtp,
                 return_dict=True,
             )
 
@@ -353,7 +356,7 @@ class VLA0Local(nn.Module):
             out = self.vlm(
                 input_ids=input_ids,
                 past_key_values=past_key_values,
-                output_hidden_states=True,
+                output_hidden_states=self.inference_mtp,
                 use_cache=True,
             )
         return out.logits[:, -1, :], out
@@ -367,6 +370,45 @@ class VLA0Local(nn.Module):
                     self.generation_finished[i] = True
 
         return sum(self.generation_finished) == len(self.generation_finished)
+
+    def flush_pending_action_number(self, batch_idx: int):
+        number_text = self.pending_action_number_text[batch_idx]
+        if not number_text:
+            return
+
+        if not number_text.isdigit():
+            self.invalid_action_generation[batch_idx] = True
+            self.pending_action_number_text[batch_idx] = ""
+            return
+
+        number = int(number_text)
+        if not 0 <= number < self.config.n_state_bins:
+            self.invalid_action_generation[batch_idx] = True
+            self.pending_action_number_text[batch_idx] = ""
+            return
+
+        self.decoded_action_numbers[batch_idx].append(number)
+        self.pending_action_number_text[batch_idx] = ""
+
+    def update_decoded_actions(self, generated_token: torch.Tensor):
+        token_texts = self.processor.batch_decode(generated_token, skip_special_tokens=True)
+
+        for i, token_text in enumerate(token_texts):
+            if self.invalid_action_generation[i]:
+                continue
+
+            for char in token_text:
+                if char.isspace():
+                    self.flush_pending_action_number(i)
+                elif char.isdigit():
+                    self.pending_action_number_text[i] += char
+                else:
+                    self.invalid_action_generation[i] = True
+                    self.pending_action_number_text[i] = ""
+                    break
+
+            if self.generation_finished[i]:
+                self.flush_pending_action_number(i)
 
     def reconstruct_actions(self, decoded_actions, batch):
         batch_size = batch[OBS_STATE].shape[0]
@@ -443,7 +485,7 @@ class VLA0Local(nn.Module):
         self.input_ids[:, : self.prefix_len] = padded_outs["input_ids"][:, 1:]
 
         with torch.inference_mode():
-            out = self.vlm(**padded_outs, use_cache=True, output_hidden_states=True)
+            out = self.vlm(**padded_outs, use_cache=True, output_hidden_states=self.inference_mtp)
 
         logits = out.logits[:, -1, :]
         self._synchronize_timing_device(logits.device)
@@ -468,6 +510,9 @@ class VLA0Local(nn.Module):
             for _ in range(batch_size)
         ]
         self.grammar_bitmask = xgr.allocate_token_bitmask(batch_size, self.vocab_size)
+        self.decoded_action_numbers = [[] for _ in range(batch_size)]
+        self.pending_action_number_text = [""] * batch_size
+        self.invalid_action_generation = [False] * batch_size
 
     def select_next_grammar_constrained_token(self, logits: torch.Tensor) -> torch.Tensor:
         constrained_logits = logits.clone()
@@ -520,6 +565,8 @@ class VLA0Local(nn.Module):
 
             self.input_ids[:, self.input_ids_len : self.input_ids_len + 1] = generated_token
             self.input_ids_len += 1
+            self.check_end_of_generation(generated_token)
+            self.update_decoded_actions(generated_token)
 
             self.past_key_values = output.past_key_values
 
@@ -558,6 +605,7 @@ class VLA0Local(nn.Module):
                 self.input_ids[:, self.input_ids_len : self.input_ids_len + 1] = generated_token
                 self.input_ids_len += 1
                 self.check_end_of_generation(generated_token)
+                self.update_decoded_actions(generated_token)
 
             logits, out = self.generate_next_token(
                 input_ids=self.input_ids[:, self.input_idx_base : self.input_ids_len],
@@ -569,6 +617,7 @@ class VLA0Local(nn.Module):
             self.input_ids_len += 1
 
             self.check_end_of_generation(generated_token)
+            self.update_decoded_actions(generated_token)
 
             if self.inference_mtp:
                 base_hidden_states = [out.hidden_states[id] for id in self.mtp_aux_ids]
@@ -576,29 +625,29 @@ class VLA0Local(nn.Module):
                     torch.cat(base_hidden_states, dim=-1)
                 )
 
-            # decode every new sequence and count amount of spaces
-            decoded_texts = self.processor.batch_decode(
-                self.input_ids[:, self.prefix_len : self.input_ids_len],
-                skip_special_tokens=True,
-            )  # return list of lists
+            target_action_end = self.action_dim * (self.action_index + 1)
+            target_action_start = self.action_dim * self.action_index
             for i in range(batch_size):
                 if next_action_is_generated[i]:
                     continue
 
-                output = decoded_texts[i].strip().split()
-
                 # if output is invalid just add zeros
-                if not all(a.isdigit() and 0 <= int(a) < self.config.n_state_bins for a in output):
+                if self.invalid_action_generation[i]:
                     next_action_is_generated[i] = True
                     decoded_actions[i] = torch.zeros(self.action_dim, device=device, dtype=torch.long)
+                    continue
 
                 # check if we finished next action generation
-                if self.generation_finished[i] or len(output) > self.action_dim * (self.action_index + 1):
+                if self.generation_finished[i]:
+                    self.flush_pending_action_number(i)
+
+                if len(self.decoded_action_numbers[i]) >= target_action_end:
                     next_action_is_generated[i] = True
-                    action_text = output[
-                        self.action_dim * (self.action_index) : self.action_dim * (self.action_index + 1)
-                    ]
-                    decoded_actions[i] = torch.tensor([int(a) for a in action_text], device=device)
+                    action_numbers = self.decoded_action_numbers[i][target_action_start:target_action_end]
+                    decoded_actions[i] = torch.tensor(action_numbers, device=device)
+                elif self.generation_finished[i]:
+                    next_action_is_generated[i] = True
+                    decoded_actions[i] = torch.zeros(self.action_dim, device=device, dtype=torch.long)
 
             if sum(next_action_is_generated) == len(next_action_is_generated):
                 self.action_index += 1

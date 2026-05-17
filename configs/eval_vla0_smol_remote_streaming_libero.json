@@ -1,0 +1,41 @@
+{
+    "env": {
+        "type": "libero",
+        "task": "libero_goal"
+    },
+    "policy": {
+        "type": "vla0_smol",
+        "pretrained_path": "olegbalakhnov/vla-0-smol-libero-eagle3",
+        "vlm_checkpoint": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
+        "use_remote_client": true,
+        "use_streaming": true,
+        "n_obs_steps": 1,
+        "device": "cuda",
+        "use_amp": true,
+        "amp_dtype": "bf16",
+        "push_to_hub": false,
+        "chunk_size": 10,
+        "n_action_steps": 5,
+        "optimizer_lr": 0.00005,
+        "optimizer_betas": [
+            0.9,
+            0.95
+        ],
+        "optimizer_eps": 1e-08,
+        "optimizer_weight_decay": 0.01,
+        "scheduler_warmup_steps": 1000,
+        "scheduler_decay_steps": 30000,
+        "scheduler_decay_lr": 5e-06,
+        "precision": "float32",
+        "freeze_vision_encoder": false,
+        "do_image_splitting": false,
+        "drop_n_last_frames": 1,
+        "grad_clip_norm": 1,
+        "crop_shape": [84, 84],
+        "relative_actions": true,
+        "use_state": true,
+        "action_mask_aug_per": 0.15,
+        "action_mask_skip_per": 0.1
+    },
+    "eval": { "n_episodes": 1, "batch_size": 1}
+}
