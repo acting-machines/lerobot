@@ -1,4 +1,3 @@
-import copy
 import random
 import time
 
@@ -8,7 +7,7 @@ from torch import Tensor, nn
 from torch.profiler import record_function
 from torchvision.transforms import CenterCrop, RandomCrop
 from transformers import AutoModelForImageTextToText, AutoProcessor
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import DynamicCache
 from transformers.models.smolvlm.image_processing_smolvlm_fast import SmolVLMImageProcessorFast
 
 from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
@@ -583,6 +582,7 @@ class VLA0Local(nn.Module):
             (self.config.max_decoding_steps - (self.input_ids_len - self.prefix_len)) / (mtp_heads + 1)
         )
         for _ in range(max_remained_steps):
+            mtp_cache_len = None
             for head_id in range(self.config.num_inference_mtp_heads):
                 if head_id == 0:
                     logits, out = self.mtp_model.generate_next_token(
@@ -590,15 +590,13 @@ class VLA0Local(nn.Module):
                         hidden_states=self.hidden_state,
                         past_key_values=self.mtp_past_key_values,
                     )
-                    local_mtp_past_key_values = Cache(
-                        layers=[copy.copy(layer) for layer in self.mtp_past_key_values.layers]
-                    )
                     self.input_idx_mtp = self.input_ids_len
+                    mtp_cache_len = self.mtp_past_key_values.get_seq_length()
                 else:
                     logits, out = self.mtp_model.generate_next_token(
                         input_ids=self.input_ids[:, self.input_ids_len - 1 : self.input_ids_len],
                         hidden_states=out.last_hidden_state[:, -1:, :],
-                        past_key_values=local_mtp_past_key_values,
+                        past_key_values=self.mtp_past_key_values,
                     )
 
                 generated_token = self.select_next_grammar_constrained_token(logits)
@@ -606,6 +604,9 @@ class VLA0Local(nn.Module):
                 self.input_ids_len += 1
                 self.check_end_of_generation(generated_token)
                 self.update_decoded_actions(generated_token)
+
+            if mtp_cache_len is not None:
+                self.mtp_past_key_values.crop(mtp_cache_len)
 
             logits, out = self.generate_next_token(
                 input_ids=self.input_ids[:, self.input_idx_base : self.input_ids_len],
