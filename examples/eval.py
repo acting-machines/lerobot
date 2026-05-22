@@ -58,7 +58,7 @@ raw_batch = next(dl_iter)
 batch = preprocessor(raw_batch)
 
 # %%
-for step in tqdm(range(100)):
+for step in tqdm(range(200)):
     # batch = {k: (v.to(device) if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
     loss, loss_dict = policy.forward(batch)
     vlm_loss = loss_dict["vlm_loss"]

@@ -124,7 +124,7 @@ pi = ["transformers @ git+https://github.com/huggingface/transformers.git@fix/le
 smolvla = ["lerobot[transformers-dep]", "num2words>=0.5.14,<0.6.0", "accelerate>=1.7.0,<2.0.0", "safetensors>=0.4.3,<1.0.0"]
 vla0_smol = ["lerobot[transformers-dep]", "num2words>=0.5.14,<0.6.0", "accelerate>=1.7.0,<2.0.0", "safetensors>=0.4.3,<1.0.0", "xgrammar==0.1.27"]
 vla0_smol_remote = ["lerobot[vla0_smol]", "fastapi>=0.128.0", "openai>=2.16.0", ]
-vllm = ["vllm==0.15.0", "num2words>=0.6.2"]
+vllm = ["vllm==0.15.0", "num2words>=0.5.14,<0.6.0"]
 groot = [
     "lerobot[transformers-dep]",
     "peft>=0.13.0,<1.0.0",

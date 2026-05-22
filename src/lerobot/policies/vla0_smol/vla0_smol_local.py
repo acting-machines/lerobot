@@ -1,5 +1,5 @@
-import copy
 import random
+import time
 
 import torch
 import xgrammar as xgr
@@ -7,7 +7,7 @@ from torch import Tensor, nn
 from torch.profiler import record_function
 from torchvision.transforms import CenterCrop, RandomCrop
 from transformers import AutoModelForImageTextToText, AutoProcessor
-from transformers.cache_utils import Cache, DynamicCache
+from transformers.cache_utils import DynamicCache
 from transformers.models.smolvlm.image_processing_smolvlm_fast import SmolVLMImageProcessorFast
 
 from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
@@ -73,27 +73,66 @@ class VLA0Local(nn.Module):
         self.processor.tokenizer.add_tokens([self.actions_mask_symbol], special_tokens=True)
         self.vlm.resize_token_embeddings(len(self.processor.tokenizer), mean_resizing=False)
         self.mask_token_id = self.processor.tokenizer.convert_tokens_to_ids(self.actions_mask_symbol)
+        self.vocab_size = len(self.processor.tokenizer)
 
         tokenizer_info = xgr.TokenizerInfo.from_huggingface(self.processor.tokenizer)
         self.grammar_compiler = xgr.GrammarCompiler(tokenizer_info)
         total_actions = self.config.chunk_size * self.config.action_feature.shape[0]
         ebnf_string = build_exact_n_numbers_grammar(total_actions, 0, self.config.n_action_bins)
         self.compiled_grammar = self.grammar_compiler.compile_grammar(ebnf_string)
+        self.stop_token_ids = list(
+            {token_id for token_id in [self.eos_token_id, self.pad_token_id] if token_id is not None}
+        )
 
-        # stream generation
-        self.new_obs = True
+        # stream generation timings
+        self.prefill_times_ms: list[float] = []
+        self.generate_one_action_new_obs_true_times_ms: list[float] = []
+        self.generate_one_action_new_obs_false_times_ms: list[float] = []
 
         # multi-token prediction
         self.train_mtp = config.num_train_mtp_heads > 0
         self.inference_mtp = config.num_inference_mtp_heads > 0
 
-        if self.train_mtp:
+        if self.train_mtp or self.inference_mtp:
             self.mtp_model = MTPModel(
                 num_heads=self.config.num_train_mtp_heads,
                 config=self.vlm.model.text_model.config,
                 input_embedding=self.vlm.get_input_embeddings(),
                 output_embedding=self.vlm.get_output_embeddings(),
             )
+
+            offset = 1
+            num_layers = self.vlm.model.text_model.config.num_hidden_layers
+
+            # Eagle3 uses 3 aux layers from layer 1, num_layers//2, num_layers-4
+            low_aux_layer = 1 + offset
+            mid_aux_layer = num_layers // 2 - 1 + offset
+            last_aux_layer = num_layers - 4 + offset
+            self.mtp_aux_ids = [low_aux_layer, mid_aux_layer, last_aux_layer]
+            print(f"MTP aux layers: {self.mtp_aux_ids}")
+
+        self.reset()
+
+    def reset(self) -> None:
+        """Clear any streaming decode state so a new rollout starts from a fresh prompt."""
+        self.new_obs = True
+        self.generation_batch = None
+        self.generation_finished = []
+        self.action_index = 0
+        self.input_idx_base = 0
+        self.input_idx_mtp = 0
+        self.input_ids_len = 0
+        self.prefix_len = 0
+        self.input_ids = None
+        self.past_key_values = None
+        self.hidden_state = None
+        self.grammar_matchers = []
+        self.grammar_bitmask = None
+        self.decoded_action_numbers = []
+        self.pending_action_number_text = []
+        self.invalid_action_generation = []
+        if self.inference_mtp:
+            self.mtp_past_key_values = None
 
     def apply_action_masking(self, actions: list[list[str]]):
         if not self.training:
@@ -255,7 +294,7 @@ class VLA0Local(nn.Module):
                 pixel_values=padded_outs["pixel_values"],
                 pixel_attention_mask=padded_outs["pixel_attention_mask"],
                 use_cache=self.config.use_cache,
-                output_hidden_states=True,
+                output_hidden_states=self.train_mtp,
                 return_dict=True,
             )
 
@@ -288,8 +327,10 @@ class VLA0Local(nn.Module):
             return loss_dict
 
         with record_function("mtp_loss"):
-            base_hidden_states = [outputs.hidden_states[id] for id in self.config.mtp_layers_ids]
-            fused_hidden_state = self.mtp_model.fuse_base_model_hidden_states(base_hidden_states)[:, :-1, :]
+            base_hidden_states = [outputs.hidden_states[id] for id in self.mtp_aux_ids]
+            fused_hidden_state = self.mtp_model.project_hidden_states(torch.cat(base_hidden_states, dim=-1))[
+                :, :-1, :
+            ]
 
             mtp_losses = self.mtp_model.calculate_mtp_loss(
                 input_ids=padded_outs["input_ids"][:, 1:],
@@ -314,11 +355,10 @@ class VLA0Local(nn.Module):
             out = self.vlm(
                 input_ids=input_ids,
                 past_key_values=past_key_values,
-                output_hidden_states=True,
+                output_hidden_states=self.inference_mtp,
                 use_cache=True,
             )
-        generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
-        return generated_token, out
+        return out.logits[:, -1, :], out
 
     def check_end_of_generation(self, generated_token=None):
         if generated_token is not None:
@@ -329,6 +369,45 @@ class VLA0Local(nn.Module):
                     self.generation_finished[i] = True
 
         return sum(self.generation_finished) == len(self.generation_finished)
+
+    def flush_pending_action_number(self, batch_idx: int):
+        number_text = self.pending_action_number_text[batch_idx]
+        if not number_text:
+            return
+
+        if not number_text.isdigit():
+            self.invalid_action_generation[batch_idx] = True
+            self.pending_action_number_text[batch_idx] = ""
+            return
+
+        number = int(number_text)
+        if not 0 <= number < self.config.n_state_bins:
+            self.invalid_action_generation[batch_idx] = True
+            self.pending_action_number_text[batch_idx] = ""
+            return
+
+        self.decoded_action_numbers[batch_idx].append(number)
+        self.pending_action_number_text[batch_idx] = ""
+
+    def update_decoded_actions(self, generated_token: torch.Tensor):
+        token_texts = self.processor.batch_decode(generated_token, skip_special_tokens=True)
+
+        for i, token_text in enumerate(token_texts):
+            if self.invalid_action_generation[i]:
+                continue
+
+            for char in token_text:
+                if char.isspace():
+                    self.flush_pending_action_number(i)
+                elif char.isdigit():
+                    self.pending_action_number_text[i] += char
+                else:
+                    self.invalid_action_generation[i] = True
+                    self.pending_action_number_text[i] = ""
+                    break
+
+            if self.generation_finished[i]:
+                self.flush_pending_action_number(i)
 
     def reconstruct_actions(self, decoded_actions, batch):
         batch_size = batch[OBS_STATE].shape[0]
@@ -349,7 +428,42 @@ class VLA0Local(nn.Module):
 
         return reconstructed_actions
 
+    def reset_prefill_timing(self):
+        self.prefill_times_ms.clear()
+
+    def get_prefill_timings_ms(self) -> list[float]:
+        return list(self.prefill_times_ms)
+
+    def reset_generate_one_action_timing(self):
+        self.generate_one_action_new_obs_true_times_ms.clear()
+        self.generate_one_action_new_obs_false_times_ms.clear()
+
+    def get_generate_one_action_new_obs_true_timings_ms(self) -> list[float]:
+        return list(self.generate_one_action_new_obs_true_times_ms)
+
+    def get_generate_one_action_new_obs_false_timings_ms(self) -> list[float]:
+        return list(self.generate_one_action_new_obs_false_times_ms)
+
+    @staticmethod
+    def _synchronize_timing_device(device: torch.device) -> None:
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+
+    def _record_generate_one_action_timing(
+        self, device: torch.device, start_time: float, started_with_new_obs: bool
+    ) -> None:
+        self._synchronize_timing_device(device)
+        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
+        if started_with_new_obs:
+            self.generate_one_action_new_obs_true_times_ms.append(elapsed_ms)
+        else:
+            self.generate_one_action_new_obs_false_times_ms.append(elapsed_ms)
+
     def prefill(self, batch):
+        timing_device = batch[OBS_STATE].device
+        self._synchronize_timing_device(timing_device)
+        start_time = time.perf_counter()
+
         images = self.prepare_images(batch)
         batch_size = batch[OBS_STATE].shape[0]
 
@@ -370,10 +484,12 @@ class VLA0Local(nn.Module):
         self.input_ids[:, : self.prefix_len] = padded_outs["input_ids"][:, 1:]
 
         with torch.inference_mode():
-            out = self.vlm(**padded_outs, use_cache=True, output_hidden_states=True)
+            out = self.vlm(**padded_outs, use_cache=True, output_hidden_states=self.inference_mtp)
 
-        generated_token = out.logits[:, -1, :].argmax(-1, keepdim=True)
-        return generated_token, out
+        logits = out.logits[:, -1, :]
+        self._synchronize_timing_device(logits.device)
+        self.prefill_times_ms.append((time.perf_counter() - start_time) * 1000.0)
+        return logits, out
 
     def initialise_new_generation(self, batch):
         batch_size = batch[OBS_STATE].shape[0]
@@ -385,10 +501,53 @@ class VLA0Local(nn.Module):
         self.input_idx_base = 0
         self.input_idx_mtp = 0
         self.input_ids_len = 0
+        self.grammar_matchers = [
+            xgr.GrammarMatcher(
+                self.compiled_grammar,
+                override_stop_tokens=self.stop_token_ids,
+            )
+            for _ in range(batch_size)
+        ]
+        self.grammar_bitmask = xgr.allocate_token_bitmask(batch_size, self.vocab_size)
+        self.decoded_action_numbers = [[] for _ in range(batch_size)]
+        self.pending_action_number_text = [""] * batch_size
+        self.invalid_action_generation = [False] * batch_size
+
+    def select_next_grammar_constrained_token(self, logits: torch.Tensor) -> torch.Tensor:
+        constrained_logits = logits.clone()
+
+        for i, matcher in enumerate(self.grammar_matchers):
+            if self.generation_finished[i] or matcher.is_terminated():
+                constrained_logits[i].fill_(float("-inf"))
+                constrained_logits[i, self.pad_token_id] = 0.0
+                continue
+
+            need_apply = matcher.fill_next_token_bitmask(self.grammar_bitmask, index=i)
+            if need_apply:
+                xgr.apply_token_bitmask_inplace(
+                    constrained_logits[i : i + 1],
+                    self.grammar_bitmask[i : i + 1].to(constrained_logits.device),
+                    vocab_size=self.vocab_size,
+                )
+
+        generated_token = constrained_logits.argmax(-1, keepdim=True)
+
+        for i, matcher in enumerate(self.grammar_matchers):
+            if self.generation_finished[i] or matcher.is_terminated():
+                generated_token[i, 0] = self.pad_token_id
+                continue
+
+            if not matcher.accept_token(generated_token[i, 0].item()):
+                raise RuntimeError(f"XGrammar rejected generated token for batch item {i}.")
+
+        return generated_token
 
     def generate_one_action(self, batch):
         device = batch[OBS_STATE].device
         batch_size = batch[OBS_STATE].shape[0]
+        started_with_new_obs = self.new_obs
+        self._synchronize_timing_device(device)
+        start_time = time.perf_counter()
 
         next_action_is_generated = [False] * batch_size
         decoded_actions = [None] * batch_size
@@ -396,7 +555,8 @@ class VLA0Local(nn.Module):
         if self.new_obs:
             self.initialise_new_generation(batch)
 
-            generated_token, output = self.prefill(batch=batch)
+            logits, output = self.prefill(batch=batch)
+            generated_token = self.select_next_grammar_constrained_token(logits)
 
             self.input_ids_len = self.prefix_len
             self.input_idx_base = self.prefix_len
@@ -404,13 +564,17 @@ class VLA0Local(nn.Module):
 
             self.input_ids[:, self.input_ids_len : self.input_ids_len + 1] = generated_token
             self.input_ids_len += 1
+            self.check_end_of_generation(generated_token)
+            self.update_decoded_actions(generated_token)
 
             self.past_key_values = output.past_key_values
 
             if self.inference_mtp:
                 self.mtp_past_key_values = DynamicCache(config=self.mtp_model.cfg)
-                base_hidden_states = [output.hidden_states[id] for id in self.config.mtp_layers_ids]
-                self.hidden_state = self.mtp_model.fuse_base_model_hidden_states(base_hidden_states)
+                base_hidden_states = [output.hidden_states[id] for id in self.mtp_aux_ids]
+                self.hidden_state = self.mtp_model.project_hidden_states(
+                    torch.cat(base_hidden_states, dim=-1)
+                )
 
         # generate one action
         mtp_heads = self.config.num_inference_mtp_heads if self.inference_mtp else 0
@@ -418,73 +582,85 @@ class VLA0Local(nn.Module):
             (self.config.max_decoding_steps - (self.input_ids_len - self.prefix_len)) / (mtp_heads + 1)
         )
         for _ in range(max_remained_steps):
+            mtp_cache_len = None
             for head_id in range(self.config.num_inference_mtp_heads):
                 if head_id == 0:
-                    generated_token, out = self.mtp_model.generate_next_token(
+                    logits, out = self.mtp_model.generate_next_token(
                         input_ids=self.input_ids[:, self.input_idx_mtp : self.input_ids_len],
                         hidden_states=self.hidden_state,
                         past_key_values=self.mtp_past_key_values,
                     )
-                    local_mtp_past_key_values = Cache(
-                        layers=[copy.copy(layer) for layer in self.mtp_past_key_values.layers]
-                    )
                     self.input_idx_mtp = self.input_ids_len
+                    mtp_cache_len = self.mtp_past_key_values.get_seq_length()
                 else:
-                    generated_token, out = self.mtp_model.generate_next_token(
+                    logits, out = self.mtp_model.generate_next_token(
                         input_ids=self.input_ids[:, self.input_ids_len - 1 : self.input_ids_len],
                         hidden_states=out.last_hidden_state[:, -1:, :],
-                        past_key_values=local_mtp_past_key_values,
+                        past_key_values=self.mtp_past_key_values,
                     )
 
+                generated_token = self.select_next_grammar_constrained_token(logits)
                 self.input_ids[:, self.input_ids_len : self.input_ids_len + 1] = generated_token
                 self.input_ids_len += 1
                 self.check_end_of_generation(generated_token)
+                self.update_decoded_actions(generated_token)
 
-            generated_token, out = self.generate_next_token(
+            if mtp_cache_len is not None:
+                self.mtp_past_key_values.crop(mtp_cache_len)
+
+            logits, out = self.generate_next_token(
                 input_ids=self.input_ids[:, self.input_idx_base : self.input_ids_len],
                 past_key_values=self.past_key_values,
             )
+            generated_token = self.select_next_grammar_constrained_token(logits)
             self.input_idx_base = self.input_ids_len
             self.input_ids[:, self.input_ids_len : self.input_ids_len + 1] = generated_token
             self.input_ids_len += 1
 
             self.check_end_of_generation(generated_token)
+            self.update_decoded_actions(generated_token)
 
             if self.inference_mtp:
-                base_hidden_states = [out.hidden_states[id] for id in self.config.mtp_layers_ids]
-                self.hidden_state = self.mtp_model.fuse_base_model_hidden_states(base_hidden_states)
+                base_hidden_states = [out.hidden_states[id] for id in self.mtp_aux_ids]
+                self.hidden_state = self.mtp_model.project_hidden_states(
+                    torch.cat(base_hidden_states, dim=-1)
+                )
 
-            # decode every new sequence and count amount of spaces
-            decoded_texts = self.processor.batch_decode(
-                self.input_ids[:, self.prefix_len : self.input_ids_len],
-                skip_special_tokens=True,
-            )  # return list of lists
+            target_action_end = self.action_dim * (self.action_index + 1)
+            target_action_start = self.action_dim * self.action_index
             for i in range(batch_size):
                 if next_action_is_generated[i]:
                     continue
 
-                output = decoded_texts[i].strip().split()
-
                 # if output is invalid just add zeros
-                if not all(a.isdigit() and 0 <= int(a) < self.config.n_state_bins for a in output):
+                if self.invalid_action_generation[i]:
                     next_action_is_generated[i] = True
                     decoded_actions[i] = torch.zeros(self.action_dim, device=device, dtype=torch.long)
+                    continue
 
                 # check if we finished next action generation
-                if self.generation_finished[i] or len(output) > self.action_dim * (self.action_index + 1):
+                if self.generation_finished[i]:
+                    self.flush_pending_action_number(i)
+
+                if len(self.decoded_action_numbers[i]) >= target_action_end:
                     next_action_is_generated[i] = True
-                    action_text = output[
-                        self.action_dim * (self.action_index) : self.action_dim * (self.action_index + 1)
-                    ]
-                    decoded_actions[i] = torch.tensor([int(a) for a in action_text], device=device)
+                    action_numbers = self.decoded_action_numbers[i][target_action_start:target_action_end]
+                    decoded_actions[i] = torch.tensor(action_numbers, device=device)
+                elif self.generation_finished[i]:
+                    next_action_is_generated[i] = True
+                    decoded_actions[i] = torch.zeros(self.action_dim, device=device, dtype=torch.long)
 
             if sum(next_action_is_generated) == len(next_action_is_generated):
                 self.action_index += 1
                 if self.action_index == self.config.n_action_steps:
                     self.new_obs = True
-                return self.reconstruct_actions(decoded_actions, self.generation_batch)
+                result = self.reconstruct_actions(decoded_actions, self.generation_batch)
+                self._record_generate_one_action_timing(device, start_time, started_with_new_obs)
+                return result
 
-        return torch.zeros((batch_size, 1, self.action_dim), device=device, dtype=torch.long)
+        result = torch.zeros((batch_size, 1, self.action_dim), device=device, dtype=torch.long)
+        self._record_generate_one_action_timing(device, start_time, started_with_new_obs)
+        return result
 
     def generate_actions(self, batch: dict[str, torch.Tensor]):
         actions = []

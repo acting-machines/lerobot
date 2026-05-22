@@ -92,6 +92,49 @@ from lerobot.utils.utils import (
 )
 
 
+def summarize_prefill_timings(prefill_times_ms: list[float]) -> dict[str, float | int]:
+    if not prefill_times_ms:
+        return {}
+
+    arr = np.array(prefill_times_ms, dtype=float)
+    return {
+        "avg_prefill_ms": float(np.nanmean(arr)),
+        "p50_prefill_ms": float(np.nanpercentile(arr, 50)),
+        "p95_prefill_ms": float(np.nanpercentile(arr, 95)),
+        "num_prefill_calls": int(arr.size),
+    }
+
+
+def summarize_generate_one_action_new_obs_true_timings(
+    generate_one_action_new_obs_true_times_ms: list[float],
+) -> dict[str, float | int]:
+    if not generate_one_action_new_obs_true_times_ms:
+        return {}
+
+    arr = np.array(generate_one_action_new_obs_true_times_ms, dtype=float)
+    return {
+        "avg_generate_one_action_new_obs_true_ms": float(np.nanmean(arr)),
+        "p50_generate_one_action_new_obs_true_ms": float(np.nanpercentile(arr, 50)),
+        "p95_generate_one_action_new_obs_true_ms": float(np.nanpercentile(arr, 95)),
+        "num_generate_one_action_new_obs_true_calls": int(arr.size),
+    }
+
+
+def summarize_generate_one_action_new_obs_false_timings(
+    generate_one_action_new_obs_false_times_ms: list[float],
+) -> dict[str, float | int]:
+    if not generate_one_action_new_obs_false_times_ms:
+        return {}
+
+    arr = np.array(generate_one_action_new_obs_false_times_ms, dtype=float)
+    return {
+        "avg_generate_one_action_new_obs_false_ms": float(np.nanmean(arr)),
+        "p50_generate_one_action_new_obs_false_ms": float(np.nanpercentile(arr, 50)),
+        "p95_generate_one_action_new_obs_false_ms": float(np.nanpercentile(arr, 95)),
+        "num_generate_one_action_new_obs_false_calls": int(arr.size),
+    }
+
+
 def rollout(
     env: gym.vector.VectorEnv,
     policy: PreTrainedPolicy,
@@ -282,6 +325,12 @@ def eval_policy(
             f"Policy of type 'PreTrainedPolicy' is expected, but type '{type(policy)}' was provided."
         )
 
+    model = getattr(policy, "model", None)
+    if hasattr(model, "reset_prefill_timing"):
+        model.reset_prefill_timing()
+    if hasattr(model, "reset_generate_one_action_timing"):
+        model.reset_generate_one_action_timing()
+
     start = time.time()
     policy.eval()
 
@@ -413,6 +462,20 @@ def eval_policy(
         thread.join()
 
     # Compile eval info.
+    prefill_timing_stats = {}
+    if hasattr(model, "get_prefill_timings_ms"):
+        prefill_timing_stats = summarize_prefill_timings(model.get_prefill_timings_ms())
+    generate_one_action_new_obs_true_timing_stats = {}
+    if hasattr(model, "get_generate_one_action_new_obs_true_timings_ms"):
+        generate_one_action_new_obs_true_timing_stats = summarize_generate_one_action_new_obs_true_timings(
+            model.get_generate_one_action_new_obs_true_timings_ms()
+        )
+    generate_one_action_new_obs_false_timing_stats = {}
+    if hasattr(model, "get_generate_one_action_new_obs_false_timings_ms"):
+        generate_one_action_new_obs_false_timing_stats = summarize_generate_one_action_new_obs_false_timings(
+            model.get_generate_one_action_new_obs_false_timings_ms()
+        )
+
     info = {
         "per_episode": [
             {
@@ -438,6 +501,9 @@ def eval_policy(
             "pc_success": float(np.nanmean(all_successes[:n_episodes]) * 100),
             "eval_s": time.time() - start,
             "eval_ep_s": (time.time() - start) / n_episodes,
+            **prefill_timing_stats,
+            **generate_one_action_new_obs_true_timing_stats,
+            **generate_one_action_new_obs_false_timing_stats,
         },
     }
 
@@ -554,7 +620,7 @@ def eval_main(cfg: EvalPipelineConfig):
         print(info["overall"])
 
         # Print per-suite stats
-        for task_group, task_group_info in info.items():
+        for task_group, task_group_info in info["per_group"].items():
             print(f"\nAggregated Metrics for {task_group}:")
             print(task_group_info)
     # Close all vec envs
@@ -573,9 +639,20 @@ class TaskMetrics(TypedDict):
     max_rewards: list[float]
     successes: list[bool]
     video_paths: list[str]
+    prefill_times_ms: list[float]
+    generate_one_action_new_obs_true_times_ms: list[float]
+    generate_one_action_new_obs_false_times_ms: list[float]
 
 
-ACC_KEYS = ("sum_rewards", "max_rewards", "successes", "video_paths")
+ACC_KEYS = (
+    "sum_rewards",
+    "max_rewards",
+    "successes",
+    "video_paths",
+    "prefill_times_ms",
+    "generate_one_action_new_obs_true_times_ms",
+    "generate_one_action_new_obs_false_times_ms",
+)
 
 
 def eval_one(
@@ -611,11 +688,25 @@ def eval_one(
     )
 
     per_episode = task_result["per_episode"]
+    prefill_times_ms = []
+    generate_one_action_new_obs_true_times_ms = []
+    generate_one_action_new_obs_false_times_ms = []
+    model = getattr(policy, "model", None)
+    if hasattr(model, "get_prefill_timings_ms"):
+        prefill_times_ms = model.get_prefill_timings_ms()
+    if hasattr(model, "get_generate_one_action_new_obs_true_timings_ms"):
+        generate_one_action_new_obs_true_times_ms = model.get_generate_one_action_new_obs_true_timings_ms()
+    if hasattr(model, "get_generate_one_action_new_obs_false_timings_ms"):
+        generate_one_action_new_obs_false_times_ms = model.get_generate_one_action_new_obs_false_timings_ms()
+
     return TaskMetrics(
         sum_rewards=[ep["sum_reward"] for ep in per_episode],
         max_rewards=[ep["max_reward"] for ep in per_episode],
         successes=[ep["success"] for ep in per_episode],
         video_paths=task_result.get("video_paths", []),
+        prefill_times_ms=prefill_times_ms,
+        generate_one_action_new_obs_true_times_ms=generate_one_action_new_obs_true_times_ms,
+        generate_one_action_new_obs_false_times_ms=generate_one_action_new_obs_false_times_ms,
     )
 
 
@@ -715,11 +806,44 @@ def eval_policy_all(
         _append("sum_rewards", metrics.get("sum_rewards"))
         _append("max_rewards", metrics.get("max_rewards"))
         _append("successes", metrics.get("successes"))
+        _append("prefill_times_ms", metrics.get("prefill_times_ms"))
+        _append(
+            "generate_one_action_new_obs_true_times_ms",
+            metrics.get("generate_one_action_new_obs_true_times_ms"),
+        )
+        _append(
+            "generate_one_action_new_obs_false_times_ms",
+            metrics.get("generate_one_action_new_obs_false_times_ms"),
+        )
         # video_paths is list-like
         paths = metrics.get("video_paths", [])
         if paths:
             group_acc[group]["video_paths"].extend(paths)
             overall["video_paths"].extend(paths)
+
+    def _task_metrics_for_output(metrics: dict) -> dict:
+        output_metrics = {
+            k: v
+            for k, v in metrics.items()
+            if k
+            not in {
+                "prefill_times_ms",
+                "generate_one_action_new_obs_true_times_ms",
+                "generate_one_action_new_obs_false_times_ms",
+            }
+        }
+        output_metrics.update(summarize_prefill_timings(metrics.get("prefill_times_ms", [])))
+        output_metrics.update(
+            summarize_generate_one_action_new_obs_true_timings(
+                metrics.get("generate_one_action_new_obs_true_times_ms", [])
+            )
+        )
+        output_metrics.update(
+            summarize_generate_one_action_new_obs_false_timings(
+                metrics.get("generate_one_action_new_obs_false_times_ms", [])
+            )
+        )
+        return output_metrics
 
     # Choose runner (sequential vs threaded)
     task_runner = partial(
@@ -742,7 +866,9 @@ def eval_policy_all(
         for task_group, task_id, env in tasks:
             tg, tid, metrics = task_runner(task_group, task_id, env)
             _accumulate_to(tg, metrics)
-            per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+            per_task_infos.append(
+                {"task_group": tg, "task_id": tid, "metrics": _task_metrics_for_output(metrics)}
+            )
     else:
         # threaded path: submit all tasks, consume completions on main thread and accumulate there
         with cf.ThreadPoolExecutor(max_workers=max_parallel_tasks) as executor:
@@ -753,7 +879,9 @@ def eval_policy_all(
             for fut in cf.as_completed(fut2meta):
                 tg, tid, metrics = fut.result()
                 _accumulate_to(tg, metrics)
-                per_task_infos.append({"task_group": tg, "task_id": tid, "metrics": metrics})
+                per_task_infos.append(
+                    {"task_group": tg, "task_id": tid, "metrics": _task_metrics_for_output(metrics)}
+                )
 
     # compute aggregated metrics helper (robust to lists/scalars)
     def _agg_from_list(xs):
@@ -771,6 +899,13 @@ def eval_policy_all(
             "pc_success": _agg_from_list(acc["successes"]) * 100 if acc["successes"] else float("nan"),
             "n_episodes": len(acc["sum_rewards"]),
             "video_paths": list(acc["video_paths"]),
+            **summarize_prefill_timings(acc["prefill_times_ms"]),
+            **summarize_generate_one_action_new_obs_true_timings(
+                acc["generate_one_action_new_obs_true_times_ms"]
+            ),
+            **summarize_generate_one_action_new_obs_false_timings(
+                acc["generate_one_action_new_obs_false_times_ms"]
+            ),
         }
 
     # overall aggregates
@@ -782,6 +917,13 @@ def eval_policy_all(
         "eval_s": time.time() - start_t,
         "eval_ep_s": (time.time() - start_t) / max(1, len(overall["sum_rewards"])),
         "video_paths": list(overall["video_paths"]),
+        **summarize_prefill_timings(overall["prefill_times_ms"]),
+        **summarize_generate_one_action_new_obs_true_timings(
+            overall["generate_one_action_new_obs_true_times_ms"]
+        ),
+        **summarize_generate_one_action_new_obs_false_timings(
+            overall["generate_one_action_new_obs_false_times_ms"]
+        ),
     }
 
     return {
