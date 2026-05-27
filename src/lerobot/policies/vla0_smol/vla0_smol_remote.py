@@ -3,6 +3,7 @@ import base64
 import functools
 import io
 import logging
+import time
 from collections.abc import AsyncGenerator
 
 import numpy as np
@@ -42,8 +43,31 @@ class VLA0Client(nn.Module):
         # Dummy param for device management
         self.register_buffer("dummy_param", torch.empty(0))
 
+        # stream generation timings
+        self.generate_one_action_new_obs_true_times_ms: list[float] = []
+        self.generate_one_action_new_obs_false_times_ms: list[float] = []
+
     def forward(self, batch):
         raise NotImplementedError("Client backend cannot be trained. Use use_remote_client=False.")
+
+    def reset_generate_one_action_timing(self):
+        self.generate_one_action_new_obs_true_times_ms.clear()
+        self.generate_one_action_new_obs_false_times_ms.clear()
+
+    def get_generate_one_action_new_obs_true_timings_ms(self) -> list[float]:
+        return list(self.generate_one_action_new_obs_true_times_ms)
+
+    def get_generate_one_action_new_obs_false_timings_ms(self) -> list[float]:
+        return list(self.generate_one_action_new_obs_false_times_ms)
+
+    def _record_stream_action_timing(self, start_time: float, action_idx: int) -> float:
+        now = time.perf_counter()
+        elapsed_ms = (now - start_time) * 1000.0
+        if action_idx == 0:
+            self.generate_one_action_new_obs_true_times_ms.append(elapsed_ms)
+        else:
+            self.generate_one_action_new_obs_false_times_ms.append(elapsed_ms)
+        return now
 
     def _process_image_to_base64(self, tensor_img: Tensor, format="PNG") -> str:
         """
@@ -160,6 +184,9 @@ class VLA0Client(nn.Module):
         if batch_size > 1:
             raise NotImplementedError("Streaming supported for batch_size=1 only.")
 
+        stream_start_time = time.perf_counter()
+        previous_action_time = stream_start_time
+
         bins = torch.linspace(-1.0 - EPS, 1.0 + EPS, self.config.n_state_bins + 1, device=device)
         bin_centers = 0.5 * (bins[:-1] + bins[1:])
 
@@ -207,6 +234,10 @@ class VLA0Client(nn.Module):
                             if self.config.relative_actions:
                                 action = action + state
 
+                            previous_action_time = self._record_stream_action_timing(
+                                previous_action_time if action_idx > 0 else stream_start_time,
+                                action_idx,
+                            )
                             yield (action_idx, action.unsqueeze(0))
                             action_idx += 1
                             found_indices = []
@@ -225,6 +256,10 @@ class VLA0Client(nn.Module):
                 if self.config.relative_actions:
                     action = action + state
 
+                self._record_stream_action_timing(
+                    previous_action_time if action_idx > 0 else stream_start_time,
+                    action_idx,
+                )
                 yield (action_idx, action.unsqueeze(0))
             else:
                 logging.error(f"Incomplete action at end of stream: {found_indices}")
