@@ -20,6 +20,16 @@ try:
 except ImportError:
     RequestOutputKind = None
 
+try:
+    from vllm.sampling_params import StructuredOutputsParams
+except ImportError:
+    StructuredOutputsParams = None
+
+try:
+    from vllm.sampling_params import GuidedDecodingParams
+except ImportError:
+    GuidedDecodingParams = None
+
 from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
 from lerobot.policies.vla0_smol.vla0_smol_common import EPS, build_exact_n_numbers_grammar
 from lerobot.utils.constants import OBS_STATE
@@ -150,10 +160,14 @@ class VLA0AsyncVLLMClient(nn.Module):
         if delta_output and RequestOutputKind is not None and "output_kind" in signature.parameters:
             kwargs["output_kind"] = RequestOutputKind.DELTA
 
-        if "structured_outputs" in signature.parameters:
-            kwargs["structured_outputs"] = {"grammar": self.grammar_str}
+        if "structured_outputs" in signature.parameters and StructuredOutputsParams is not None:
+            kwargs["structured_outputs"] = StructuredOutputsParams(grammar=self.grammar_str)
         elif "guided_decoding" in signature.parameters:
-            kwargs["guided_decoding"] = {"grammar": self.grammar_str}
+            guided_decoding_cls = GuidedDecodingParams or StructuredOutputsParams
+            if guided_decoding_cls is None:
+                logging.warning("vLLM SamplingParams does not expose grammar-guided decoding params.")
+            else:
+                kwargs["guided_decoding"] = guided_decoding_cls(grammar=self.grammar_str)
         else:
             logging.warning("vLLM SamplingParams does not expose grammar-guided decoding.")
 
