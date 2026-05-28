@@ -27,7 +27,6 @@ class VLA0SmolConfig(PreTrainedConfig):
     vllm_gpu_memory_utilization: float = 0.8
     vllm_enforce_eager: bool = False
     vllm_attention_backend: str | None = "TRITON_ATTN"
-    vllm_max_concurrent_requests: int = 64
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
