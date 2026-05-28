@@ -20,6 +20,13 @@ from lerobot.policies.vla0_smol.temporal_ensembler import VLA0TemporalEnsembler
 from lerobot.policies.vla0_smol.vla0_smol_local import VLA0Local
 
 try:
+    from lerobot.policies.vla0_smol.vla0_smol_async_vllm import VLA0AsyncVLLMClient
+
+    HAS_ASYNC_VLLM_DEPS = True
+except ImportError:
+    HAS_ASYNC_VLLM_DEPS = False
+
+try:
     from lerobot.policies.vla0_smol.vla0_smol_remote import VLA0Client
 
     HAS_REMOTE_DEPS = True
@@ -52,7 +59,14 @@ class VLA0SmolPolicy(PreTrainedPolicy):
         super().__init__(config)
         config.validate_features()
         self.config = config
-        if self.config.use_remote_client:
+        if self.config.use_async_vllm_client:
+            logging.info("VLA0 Policy: Initializing in LOCAL ASYNC vLLM mode.")
+            if not HAS_ASYNC_VLLM_DEPS:
+                raise ImportError("Please install `vllm` and `pillow` for async vLLM inference.")
+            self.model = VLA0AsyncVLLMClient(config)
+            if self.config.use_streaming:
+                self.service = AsyncInferenceService(self.model)
+        elif self.config.use_remote_client:
             logging.info("VLA0 Policy: Initializing in REMOTE CLIENT mode (vLLM).")
             if not HAS_REMOTE_DEPS:
                 raise ImportError("Please install `openai` and `pillow` for remote inference.")
@@ -90,7 +104,7 @@ class VLA0SmolPolicy(PreTrainedPolicy):
         if self.use_ensembling:
             self.temporal_ensembler.reset()
 
-        if self.config.use_remote_client and self.config.use_streaming:
+        if self._uses_vllm_streaming:
             self.service.reset()
 
     def get_optim_params(self) -> dict:
@@ -103,10 +117,17 @@ class VLA0SmolPolicy(PreTrainedPolicy):
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
-        if self.config.use_remote_client and self.config.use_streaming:
+        if self._uses_vllm_streaming:
             return self.select_action_remote_streaming(batch)
         else:
             return self.select_action_common(batch)
+
+    @property
+    def _uses_vllm_streaming(self) -> bool:
+        return getattr(self.config, "use_streaming", False) and (
+            getattr(self.config, "use_remote_client", False)
+            or getattr(self.config, "use_async_vllm_client", False)
+        )
 
     def select_action_common(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.

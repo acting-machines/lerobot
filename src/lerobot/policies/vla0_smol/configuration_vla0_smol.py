@@ -18,9 +18,16 @@ class VLA0SmolConfig(PreTrainedConfig):
     ensemble_size: int = 0
 
     use_remote_client: bool = False
+    use_async_vllm_client: bool = False
     use_streaming: bool = False
     vllm_url: str = "http://localhost:8000/"
     vllm_api_key: str = "EMPTY"
+    vllm_model: str = "olegbalakhnov/vla-0-smol-vllm"
+    vllm_max_model_len: int = 4096
+    vllm_gpu_memory_utilization: float = 0.8
+    vllm_enforce_eager: bool = False
+    vllm_attention_backend: str | None = "TRITON_ATTN"
+    vllm_max_concurrent_requests: int = 64
 
     normalization_mapping: dict[str, NormalizationMode] = field(
         default_factory=lambda: {
