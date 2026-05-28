@@ -324,7 +324,7 @@ class LiberoEnv(EnvConfig):
 
     @property
     def gym_kwargs(self) -> dict:
-        return {"obs_type": self.obs_type, "render_mode": self.render_mode, "task_ids": [0, 1, 2, 3, 4]}
+        return {"obs_type": self.obs_type, "render_mode": self.render_mode, "task_ids": [1]}
 
 
 @EnvConfig.register_subclass("metaworld")

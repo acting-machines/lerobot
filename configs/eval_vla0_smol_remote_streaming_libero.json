@@ -5,7 +5,7 @@
     },
     "policy": {
         "type": "vla0_smol",
-        "pretrained_path": "olegbalakhnov/vla-0-smol-libero-eagle3",
+        "pretrained_path": "olegbalakhnov/vla-0-smol-spec",
         "vlm_checkpoint": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct",
         "use_remote_client": true,
         "use_streaming": true,
@@ -31,8 +31,11 @@
         "do_image_splitting": false,
         "drop_n_last_frames": 1,
         "grad_clip_norm": 1,
-        "crop_shape": [84, 84],
-        "relative_actions": true,
+        "crop_shape": [
+            230,
+            230
+        ],
+        "relative_actions": false,
         "use_state": true,
         "action_mask_aug_per": 0.15,
         "action_mask_skip_per": 0.1
