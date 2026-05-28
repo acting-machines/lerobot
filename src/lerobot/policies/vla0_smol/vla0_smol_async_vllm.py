@@ -58,6 +58,9 @@ class VLA0AsyncVLLMClient(nn.Module):
             "limit_mm_per_prompt": {"image": max(1, len(self.image_keys))},
             "gpu_memory_utilization": self.config.vllm_gpu_memory_utilization,
             "enforce_eager": self.config.vllm_enforce_eager,
+            "mm_processor_kwargs": {
+                "do_image_splitting": False,
+            },
         }
         if self.config.vllm_attention_backend is not None:
             engine_kwargs["attention_backend"] = self.config.vllm_attention_backend
@@ -111,15 +114,19 @@ class VLA0AsyncVLLMClient(nn.Module):
             raise NotImplementedError(f"Async vLLM client supports batch_size=1 only, got {batch_size}.")
 
     def _process_image(self, tensor_img: Tensor) -> Image.Image:
-        """
-        Converts a (C, H, W) float tensor to a PIL RGB image for vLLM multimodal input.
-        """
         if self.do_crop:
             tensor_img = self.center_crop_fn(tensor_img)
 
-        arr = tensor_img.permute(1, 2, 0).detach().cpu().numpy()
-        arr = (arr * 255).clip(0, 255).astype(np.uint8)
-        return Image.fromarray(arr).convert("RGB")
+        # Make contiguous before CPU transfer.
+        tensor_img = tensor_img.detach()
+
+        if tensor_img.device.type != "cpu":
+            tensor_img = tensor_img.to("cpu", non_blocking=True)
+
+        arr = tensor_img.permute(1, 2, 0).contiguous().numpy()
+        arr = (arr * 255.0).clip(0, 255).astype(np.uint8)
+
+        return Image.fromarray(arr, mode="RGB")
 
     def _build_prompt_inputs(self, batch: dict[str, Tensor], index: int) -> tuple[dict, Tensor]:
         state = batch[OBS_STATE][index]
