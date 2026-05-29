@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch import Tensor, nn
+from torch.profiler import ProfilerActivity, profile
 from torchvision.transforms import CenterCrop
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -32,6 +33,9 @@ except ImportError:
 from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
 from lerobot.policies.vla0_smol.vla0_smol_common import EPS, build_exact_n_numbers_grammar
 from lerobot.utils.constants import OBS_STATE
+
+STREAM_FIRST_ACTION_PROFILE = False
+STREAM_FIRST_ACTION_TRACE = "trace_vla0_stream_first_action.json"
 
 
 class VLA0AsyncVLLMClient(nn.Module):
@@ -257,6 +261,13 @@ class VLA0AsyncVLLMClient(nn.Module):
 
         inputs, state = self._build_prompt_inputs(batch, 0)
         request_id = f"vla0-stream-{next(self._request_counter)}"
+        profiler = None
+        if STREAM_FIRST_ACTION_PROFILE:
+            activities = [ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                activities.append(ProfilerActivity.CUDA)
+            profiler = profile(activities=activities, record_shapes=True, with_stack=True)
+            profiler.start()
 
         current_buffer = ""
         found_indices = []
@@ -299,6 +310,10 @@ class VLA0AsyncVLLMClient(nn.Module):
                                 previous_action_time if action_idx > 0 else stream_start_time,
                                 action_idx,
                             )
+                            if action_idx == 0 and profiler is not None:
+                                profiler.stop()
+                                profiler.export_chrome_trace(STREAM_FIRST_ACTION_TRACE)
+                                profiler = None
                             yield (action_idx, action.unsqueeze(0))
                             action_idx += 1
                             found_indices = []
@@ -322,6 +337,9 @@ class VLA0AsyncVLLMClient(nn.Module):
                 previous_action_time if action_idx > 0 else stream_start_time,
                 action_idx,
             )
+            if action_idx == 0 and profiler is not None:
+                profiler.stop()
+                profiler.export_chrome_trace(STREAM_FIRST_ACTION_TRACE)
             yield (action_idx, action.unsqueeze(0))
         elif len(found_indices) > 0:
             logging.error(f"Incomplete action at end of stream: {found_indices}")
