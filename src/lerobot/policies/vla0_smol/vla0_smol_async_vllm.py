@@ -7,7 +7,6 @@ from collections.abc import AsyncGenerator
 
 import numpy as np
 import torch
-from PIL import Image
 from torch import Tensor, nn
 from torch.profiler import ProfilerActivity, profile
 from torchvision.transforms import CenterCrop
@@ -117,20 +116,17 @@ class VLA0AsyncVLLMClient(nn.Module):
         if batch_size != 1:
             raise NotImplementedError(f"Async vLLM client supports batch_size=1 only, got {batch_size}.")
 
-    def _process_image(self, tensor_img: Tensor) -> Image.Image:
+    def _process_image(self, tensor_img: Tensor):
         if self.do_crop:
             tensor_img = self.center_crop_fn(tensor_img)
 
-        # Make contiguous before CPU transfer.
         tensor_img = tensor_img.detach()
-
         if tensor_img.device.type != "cpu":
             tensor_img = tensor_img.to("cpu", non_blocking=True)
 
         arr = tensor_img.permute(1, 2, 0).contiguous().numpy()
         arr = (arr * 255.0).clip(0, 255).astype(np.uint8)
-
-        return Image.fromarray(arr, mode="RGB")
+        return arr
 
     def _build_prompt_inputs(self, batch: dict[str, Tensor], index: int) -> tuple[dict, Tensor]:
         state = batch[OBS_STATE][index]
