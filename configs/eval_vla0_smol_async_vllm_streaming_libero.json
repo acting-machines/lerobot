@@ -10,7 +10,7 @@
         "use_remote_client": false,
         "use_async_vllm_client": true,
         "use_streaming": true,
-        "vllm_model": "olegbalakhnov/vla-0-smol-libero-vllm",
+        "vllm_model": "olegbalakhnov/vla-0-smol-libero-vllm-fast-processor",
         "vllm_max_model_len": 1024,
         "vllm_gpu_memory_utilization": 0.8,
         "vllm_enforce_eager": false,

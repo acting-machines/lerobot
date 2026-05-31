@@ -35,6 +35,7 @@ from lerobot.policies.vla0_smol.vla0_smol_common import EPS, build_exact_n_numbe
 from lerobot.utils.constants import OBS_STATE
 
 STREAM_FIRST_ACTION_PROFILE = False
+STREAM_FIRST_ACTION_PROFILE_WARMUP_STEPS = 0
 STREAM_FIRST_ACTION_TRACE = "trace_vla0_stream_first_action.json"
 
 
@@ -84,6 +85,7 @@ class VLA0AsyncVLLMClient(nn.Module):
         # stream generation timings
         self.generate_one_action_new_obs_true_times_ms: list[float] = []
         self.generate_one_action_new_obs_false_times_ms: list[float] = []
+        self._stream_first_action_profile_step = 0
 
     def forward(self, batch):
         raise NotImplementedError("Async vLLM backend cannot be trained. Use use_async_vllm_client=False.")
@@ -112,6 +114,14 @@ class VLA0AsyncVLLMClient(nn.Module):
         else:
             self.generate_one_action_new_obs_false_times_ms.append(elapsed_ms)
         return now
+
+    def _should_profile_stream_first_action(self) -> bool:
+        if not STREAM_FIRST_ACTION_PROFILE:
+            return False
+
+        profile_step = self._stream_first_action_profile_step
+        self._stream_first_action_profile_step += 1
+        return profile_step >= max(0, STREAM_FIRST_ACTION_PROFILE_WARMUP_STEPS)
 
     def _validate_batch_size_one(self, batch: dict[str, Tensor]) -> None:
         batch_size = batch[OBS_STATE].shape[0]
@@ -260,7 +270,7 @@ class VLA0AsyncVLLMClient(nn.Module):
         inputs, state = self._build_prompt_inputs(batch, 0)
         request_id = f"vla0-stream-{next(self._request_counter)}"
         profiler = None
-        if STREAM_FIRST_ACTION_PROFILE:
+        if self._should_profile_stream_first_action():
             activities = [ProfilerActivity.CPU]
             if torch.cuda.is_available():
                 activities.append(ProfilerActivity.CUDA)
