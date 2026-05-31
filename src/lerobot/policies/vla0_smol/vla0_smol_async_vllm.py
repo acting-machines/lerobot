@@ -30,6 +30,7 @@ except ImportError:
     GuidedDecodingParams = None
 
 from lerobot.policies.vla0_smol.configuration_vla0_smol import VLA0SmolConfig
+from lerobot.policies.vla0_smol.monkey_patch import patch_SmolVLMImageProcessorFast_vllm
 from lerobot.policies.vla0_smol.vla0_smol_common import EPS, build_exact_n_numbers_grammar
 from lerobot.utils.constants import OBS_STATE
 
@@ -50,6 +51,7 @@ class VLA0AsyncVLLMClient(nn.Module):
             self.center_crop_fn = CenterCrop(config.crop_shape)
 
         self.model_name = self.config.vllm_model
+        patch_SmolVLMImageProcessorFast_vllm()
 
         total_actions = self.config.chunk_size * self.config.action_feature.shape[0]
         self.grammar_str = build_exact_n_numbers_grammar(total_actions, 0, self.config.n_action_bins)

@@ -1,6 +1,27 @@
+from functools import wraps
+
 import torch
+from transformers.models.smolvlm.image_processing_smolvlm_fast import SmolVLMImageProcessorFast
 from transformers.models.smolvlm.modeling_smolvlm import SmolVLMModel
 from transformers.models.smolvlm.processing_smolvlm import SmolVLMProcessor
+
+
+def patch_SmolVLMImageProcessorFast_vllm():  # noqa: N802
+    if getattr(SmolVLMImageProcessorFast, "_lerobot_vllm_channel_order_patched", False):
+        return
+    SmolVLMProcessor.image_processor_class = "SmolVLMImageProcessorFast"
+    orig_preprocess = SmolVLMImageProcessorFast._preprocess
+
+    @wraps(orig_preprocess)
+    def patched_preprocess(self, images, *args, **kwargs):
+        for image in images:
+            if len(image) > 0 and image[0].ndim >= 3 and image[0].shape[1] == 3:
+                image[0] = image[0].transpose(0, 1)
+
+        return orig_preprocess(self, images, *args, **kwargs)
+
+    SmolVLMImageProcessorFast._preprocess = patched_preprocess
+    SmolVLMImageProcessorFast._lerobot_vllm_channel_order_patched = True
 
 
 def patch_SmolVLMProcessor():  # noqa: N802
