@@ -60,12 +60,12 @@ print("Policy config created.")
 
 eval_cfg = cfg.get("eval", {})
 batch_size = 1
-n_batches = max(1, eval_cfg.get("n_episodes", 1))
+n_batches = 50
 warmup_batches = 5
 
 device = torch.device(policy_cfg.device)
 
-dataset_cfg = {"repo_id": "HuggingFaceVLA/libero"}
+dataset_cfg = {"repo_id": "HuggingFaceVLA/smol-libero"}
 source = dataset_cfg["repo_id"]
 print(f"Loading dataset metadata: {source}")
 dataset_metadata = LeRobotDatasetMetadata(
