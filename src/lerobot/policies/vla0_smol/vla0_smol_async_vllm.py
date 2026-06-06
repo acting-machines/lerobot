@@ -4,11 +4,11 @@ import itertools
 import logging
 import time
 from collections.abc import AsyncGenerator
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch import Tensor, nn
-from torch.profiler import ProfilerActivity, profile
 from torchvision.transforms import CenterCrop
 from vllm import SamplingParams
 from vllm.engine.arg_utils import AsyncEngineArgs
@@ -37,6 +37,7 @@ from lerobot.utils.constants import OBS_STATE
 STREAM_FIRST_ACTION_PROFILE = False
 STREAM_FIRST_ACTION_PROFILE_WARMUP_STEPS = 0
 STREAM_FIRST_ACTION_TRACE = "trace_vla0_stream_first_action.json"
+VLLM_PROFILE_DIR = Path(__file__).resolve().parents[4] / "profile"
 
 
 class VLA0AsyncVLLMClient(nn.Module):
@@ -56,6 +57,7 @@ class VLA0AsyncVLLMClient(nn.Module):
 
         total_actions = self.config.chunk_size * self.config.action_feature.shape[0]
         self.grammar_str = build_exact_n_numbers_grammar(total_actions, 0, self.config.n_action_bins)
+        VLLM_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
 
         engine_kwargs = {
             "model": self.model_name,
@@ -66,6 +68,14 @@ class VLA0AsyncVLLMClient(nn.Module):
             "enforce_eager": self.config.vllm_enforce_eager,
             "mm_processor_kwargs": {
                 "do_image_splitting": False,
+            },
+            "profiler_config": {
+                "profiler": "torch",
+                "torch_profiler_dir": str(VLLM_PROFILE_DIR),
+                # Optional, reduce overhead/noise:
+                "torch_profiler_with_stack": True,
+                "torch_profiler_record_shapes": True,
+                "torch_profiler_with_memory": False,
             },
         }
         if self.config.vllm_attention_backend is not None:
@@ -121,7 +131,7 @@ class VLA0AsyncVLLMClient(nn.Module):
 
         profile_step = self._stream_first_action_profile_step
         self._stream_first_action_profile_step += 1
-        return profile_step >= max(0, STREAM_FIRST_ACTION_PROFILE_WARMUP_STEPS)
+        return profile_step == STREAM_FIRST_ACTION_PROFILE_WARMUP_STEPS
 
     def _validate_batch_size_one(self, batch: dict[str, Tensor]) -> None:
         batch_size = batch[OBS_STATE].shape[0]
@@ -269,13 +279,10 @@ class VLA0AsyncVLLMClient(nn.Module):
 
         inputs, state = self._build_prompt_inputs(batch, 0)
         request_id = f"vla0-stream-{next(self._request_counter)}"
-        profiler = None
+        profiler = False
         if self._should_profile_stream_first_action():
-            activities = [ProfilerActivity.CPU]
-            if torch.cuda.is_available():
-                activities.append(ProfilerActivity.CUDA)
-            profiler = profile(activities=activities, record_shapes=True, with_stack=True)
-            profiler.start()
+            await self.llm.start_profile()
+            profiler = True
 
         current_buffer = ""
         found_indices = []
@@ -318,10 +325,9 @@ class VLA0AsyncVLLMClient(nn.Module):
                                 previous_action_time if action_idx > 0 else stream_start_time,
                                 action_idx,
                             )
-                            if action_idx == 0 and profiler is not None:
-                                profiler.stop()
-                                profiler.export_chrome_trace(STREAM_FIRST_ACTION_TRACE)
-                                profiler = None
+                            if action_idx == 0 and profiler is True:
+                                await self.llm.stop_profile()
+                                profiler = False
                             yield (action_idx, action.unsqueeze(0))
                             action_idx += 1
                             found_indices = []
@@ -345,9 +351,9 @@ class VLA0AsyncVLLMClient(nn.Module):
                 previous_action_time if action_idx > 0 else stream_start_time,
                 action_idx,
             )
-            if action_idx == 0 and profiler is not None:
-                profiler.stop()
-                profiler.export_chrome_trace(STREAM_FIRST_ACTION_TRACE)
+            if action_idx == 0 and profiler is True:
+                await self.llm.stop_profile()
+                profiler = False
             yield (action_idx, action.unsqueeze(0))
         elif len(found_indices) > 0:
             logging.error(f"Incomplete action at end of stream: {found_indices}")
